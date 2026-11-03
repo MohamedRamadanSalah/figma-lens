@@ -117,8 +117,9 @@ test('component map: init, lookup (exact + wildcard), and spec.md annotations', 
   assert.deepEqual(r.added.components.sort(), ['Badge', 'Card', 'Icon/Bell']);
   assert.deepEqual(r.added.tokens, ['color/primary']);
 
+  // Real order: `map` already wrote "Icon/Bell": "" — the user then adds a wildcard and leaves it.
   const raw = JSON.parse(fs.readFileSync(mapFile, 'utf8'));
-  delete raw.components['Icon/Bell'];
+  assert.deepEqual(raw.components['Icon/Bell'], { flutter: '', web: '', props: {} });
   raw.components.Card = { flutter: 'lib/widgets/app_card.dart#AppCard', web: '', props: { Style: 'variant' } };
   raw.components['Icon/*'] = "SvgPicture.asset('assets/icons/<name>.svg')";
   raw.tokens['color/primary'] = { flutter: 'AppColors.primary', web: 'var(--primary)' };

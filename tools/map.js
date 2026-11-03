@@ -43,10 +43,11 @@ function isSet(entry) {
   return false;
 }
 
-// Exact key first, then the longest matching "Prefix*" wildcard.
+// Exact key first, then the longest matching "Prefix*" wildcard. An exact key that is still
+// an empty placeholder ("" from `figma-lens map`) means "no answer here", so fall through.
 function lookup(table, name) {
   if (!table || !name) return null;
-  if (Object.prototype.hasOwnProperty.call(table, name)) return isSet(table[name]) ? table[name] : null;
+  if (Object.prototype.hasOwnProperty.call(table, name) && isSet(table[name])) return table[name];
   let best = null;
   for (const key of Object.keys(table)) {
     if (!key.endsWith('*')) continue;
