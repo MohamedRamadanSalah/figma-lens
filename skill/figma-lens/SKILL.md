@@ -18,12 +18,16 @@ design/
     sections/NN-name.png    ← crops of the top-level blocks at full resolution
     assets/*.svg            ← icons/vector art, ready to use
     images/*                ← original bitmaps used as image fills
+    compare/                ← written by `figma-lens check` (report.md, side-by-side.png, diff.png)
+figma-lens.map.json         ← (project root) Figma component/token → real code in this project
 ```
+
+The `figma-lens` command is the CLI from the figma-lens repo (`npm link` there makes it global; otherwise run `node <figma-lens>/bin/figma-lens.js …`). Run `figma-lens help` for all commands.
 
 ## If there is no export yet
 
-1. Start the bridge for the user's project and keep it running:
-   `node <figma-lens>/bridge/server.js --out <project>/design` (or `npm run bridge` inside figma-lens; it writes `./design`).
+1. Start the bridge for the user's project and keep it running (in the background):
+   `figma-lens bridge --out <project>/design`.
 2. Ask the user to select the frame(s) in Figma desktop → Plugins → Development → Figma Lens → **Export to Claude**.
 3. Read `design/INDEX.md` to confirm it arrived.
 
@@ -33,12 +37,51 @@ Never guess a design from a description when an export is possible. Ask for the 
 
 1. **Read `spec.md` fully** (it is small). Note the frame size, the layout tree, the variables and styles, and the assets.
 2. **Look at the images.** Read `sections/*.png` one by one for detail. Use `screen@2x.png` only for the overall picture, because large images are downscaled when you view them. Values always come from the spec, never from measuring pixels.
-3. **Map tokens before writing code.** Search the codebase for the existing theme (Flutter `ThemeData`, `AppColors`, `TextTheme`, spacing constants; web CSS variables, Tailwind config). Map each Figma variable or style to the existing token with the same value or name. Use raw values only when no token exists, and tell the user which ones you added.
-4. **Reuse components.** A layer marked `component Button {Type=Primary}` should use the project's existing Button widget or component with matching props. Build a new one only if none exists.
+3. **Use the component map** (see "Component map" below). Every `⇒ USE …` in spec.md is mandatory: use that widget/component and its prop mapping, and use mapped tokens (`(color/primary ⇒ AppColors.primary)`) instead of raw values. For items marked `(not in map)`, search the codebase for the existing theme and widgets (Flutter `ThemeData`, `AppColors`, `TextTheme`, spacing constants, `lib/widgets`; web CSS variables, Tailwind config, `src/components`). Use raw values only when no token exists, and tell the user which ones you added.
+4. **Reuse components.** A layer marked `component Button {Type=Primary}` should use the project's existing Button widget or component with matching props. Build a new one only if none exists, make it reusable, and add it to the map.
 5. **Build top-down, following the tree.** Auto layout maps to Row/Column/flex (tables below). Only `@x,y` layers (no auto layout, or `absolute`) need Stack/Positioned or absolute positioning.
 6. **Use the exported files.** Put `assets/*.svg` and `images/*` into the project's asset folder and reference them. Never redraw icons and never substitute a different icon set.
 7. **Copy text exactly** from `"…"` in spec.md, including case, punctuation and Arabic/RTL strings. Text with several `run` lines needs rich text (TextSpan / nested spans).
-8. **Verify.** Run the app or page at the frame's width and compare it section by section with the crops: spacing, sizes, colors, fonts, radii, shadows, alignment, text wrapping. Fix the differences. Report anything you could not match (missing font, unsupported effect).
+8. **Verify with the compare-and-fix loop** (below). Don't declare a screen done from reading code; prove it with a screenshot diff.
+
+## Compare-and-fix loop
+
+After building a screen, compare the real result against Figma and fix what differs:
+
+1. **Run the build** showing that screen:
+   - Web: start the dev server and open the route.
+   - Flutter web: `flutter run -d web-server --web-port 8080`, then use that URL.
+   - Flutter Android: run the app on an emulator/device and navigate to the screen.
+2. **Check it:**
+   - Web / Flutter web: `figma-lens check --design design/<frame> --url http://localhost:<port>/<route>`
+     (the viewport is set to the frame's size and scale automatically).
+   - Android: `figma-lens check --design design/<frame> --adb --crop-top <status bar px> [--crop-bottom <nav bar px>]`
+     (status bar ≈ 24–48 dp × device density; crop it so only the app content is compared).
+3. **Read `design/<frame>/compare/report.md`** (mismatch %, the biggest differing areas and the Figma layer ids in each) and **look at `compare/side-by-side.png`** (Figma | build | diff, red = different).
+4. **Fix top-down**: height or spacing differences first (they shift everything below), then sizes, colors, typography, radii, shadows. Look up each listed layer id in spec.md for the exact values.
+5. **Re-run the check.** The report shows the previous score, so you can see progress.
+6. **Stop** when mismatch is ≤ 3% (text anti-aliasing never reaches 0) or when two runs in a row stop improving. Then report the final score and anything you could not match, and why (missing font, platform rendering, dynamic data).
+
+Rules: fix the real code, never game the diff (no screenshots or images of the design inside the app). Use the same data/text as the design when checking (mock data if needed), otherwise text differences dominate the score.
+
+## Component map
+
+`figma-lens.map.json` (project root) maps Figma components and tokens to this project's code:
+
+```json
+{
+  "components": {
+    "Button": { "flutter": "lib/widgets/app_button.dart#AppButton", "web": "src/components/Button.tsx#Button", "props": { "Label": "label", "Type": "variant" } },
+    "Icon/*": "SvgPicture.asset('assets/icons/<name>.svg')"
+  },
+  "tokens": { "color/primary": { "flutter": "AppColors.primary", "web": "var(--color-primary)" } }
+}
+```
+
+- No map yet → run `figma-lens map --design design`. It adds every component and token from the exports with empty values (`""`).
+- **Fill it yourself**: search the codebase for each component (by name, by look, by props) and each token value; write `path#Symbol` (or an expression). Leave `""` only when nothing exists yet. `"Prefix/*"` matches a whole family (icons).
+- After editing the map, run `figma-lens render design/<frame>` so spec.md shows the `⇒ USE` arrows. The bridge also applies the map on every new export.
+- When you create a new reusable widget for an unmapped component, add it to the map.
 
 ## Reading spec.md
 

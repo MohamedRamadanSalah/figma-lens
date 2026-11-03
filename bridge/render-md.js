@@ -1,7 +1,17 @@
 // Turns a figma-lens payload into a compact, Claude-friendly spec.md, plus a usage
 // summary of the raw values (colors, type, spacing, radii, shadows) used in the frame.
 
+import { componentTarget, tokenTarget, targetStr, MAP_FILE } from '../tools/map.js';
+
 const num = (n) => (Number.isInteger(n) ? String(n) : String(Math.round(n * 100) / 100));
+
+// Component/token map for the render in progress (renderMarkdown is synchronous).
+let MAP = null;
+
+function tokenRef(name) {
+  const t = tokenTarget(MAP, name);
+  return t ? `${name} ⇒ ${targetStr(t)}` : name;
+}
 
 function eachNode(node, fn, parent = null) {
   if (!node) return;
@@ -66,7 +76,7 @@ function typeKey(s) {
 }
 
 function paintStr(p) {
-  if (p.type === 'solid') return p.color + (p.var ? ` (${p.var})` : '');
+  if (p.type === 'solid') return p.color + (p.var ? ` (${tokenRef(p.var)})` : '');
   if (p.type.startsWith('gradient')) {
     const angle = p.cssAngle != null ? ` ${p.cssAngle}deg` : '';
     const stops = p.stops.map((s) => `${s.color} ${Math.round(s.pos * 100)}%`).join(', ');
@@ -154,10 +164,14 @@ function nodeLine(n, parent) {
     let s = c.definition ? `defines component ${c.name}` : `component ${c.name}`;
     if (c.variant) s += ` {${c.variant}}`;
     if (c.props) s += ` props{${Object.entries(c.props).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ')}}`;
+    if (MAP && !c.definition) {
+      const t = componentTarget(MAP, c.name);
+      s += t ? ` ⇒ USE ${targetStr(t)}` : ' ⇒ (not in map)';
+    }
     parts.push(s);
   }
   if (n.asset) parts.push(`→ ${n.asset}`);
-  if (n.vars) parts.push(`vars{${Object.entries(n.vars).map(([k, v]) => `${k}=${v}`).join(', ')}}`);
+  if (n.vars) parts.push(`vars{${Object.entries(n.vars).map(([k, v]) => `${k}=${tokenRef(v)}`).join(', ')}}`);
   if (n.text) parts.push(textStr(n.text));
   return parts.join(' · ');
 }
@@ -187,7 +201,43 @@ function fmtVarValue(v) {
   return JSON.stringify(v);
 }
 
-export function renderMarkdown(payload, usage) {
+function componentMapLines(spec, map) {
+  const used = new Map();
+  eachNode(spec, (n) => {
+    if (n.component && !n.component.definition) used.set(n.component.name, (used.get(n.component.name) || 0) + 1);
+  });
+  if (!used.size) return [];
+  const out = ['## Component map'];
+  if (!map) {
+    out.push(`No \`${MAP_FILE}\` found. Create one with \`figma-lens map --design <design dir>\` and point each component at your real widget, so it gets reused instead of rebuilt.`);
+    out.push('');
+    return out;
+  }
+  out.push(`From \`${map.file}\`. **Always use the mapped code** for these components; do not rebuild them.`);
+  const missing = [];
+  for (const [name, count] of [...used.entries()].sort((a, b) => b[1] - a[1])) {
+    const t = componentTarget(map, name);
+    if (t) out.push(`- ${name} ×${count} ⇒ ${targetStr(t)}`);
+    else missing.push(`${name} ×${count}`);
+  }
+  if (missing.length) {
+    out.push('');
+    out.push(`**Not mapped yet:** ${missing.join(', ')}. Find the existing widget in the codebase (or create a reusable one), add it to the map, then run \`figma-lens render <this folder>\`.`);
+  }
+  out.push('');
+  return out;
+}
+
+export function renderMarkdown(payload, usage, map = null) {
+  MAP = map;
+  try {
+    return renderMarkdownInner(payload, usage, map);
+  } finally {
+    MAP = null;
+  }
+}
+
+function renderMarkdownInner(payload, usage, map) {
   const { meta, spec, tokens = {} } = payload;
   const out = [];
   out.push(`# ${meta.nodeName}`);
@@ -216,6 +266,8 @@ export function renderMarkdown(payload, usage) {
     out.push('');
   }
 
+  out.push(...componentMapLines(spec, map));
+
   const cols = Object.entries(tokens.variables || {});
   if (cols.length) {
     out.push('## Variables used');
@@ -224,7 +276,8 @@ export function renderMarkdown(payload, usage) {
       for (const [name, v] of Object.entries(data.vars || {})) {
         const vals = Object.entries(v.values || {}).map(([mode, val]) => `${mode} ${fmtVarValue(val)}`).join(' · ');
         const code = v.code ? ` code ${JSON.stringify(v.code)}` : '';
-        out.push(`- \`${name}\` ${v.type}: ${vals}${code}`);
+        const t = tokenTarget(MAP, name);
+        out.push(`- \`${name}\` ${v.type}: ${vals}${code}${t ? ` ⇒ ${targetStr(t)}` : ''}`);
       }
       out.push('');
     }
@@ -238,7 +291,8 @@ export function renderMarkdown(payload, usage) {
       if (s.type === 'text') desc = `text ${s.font} ${s.style} ${num(s.size)}/${s.lineHeight} ls ${s.letterSpacing}`;
       else if (s.type === 'paint') desc = `paint ${paintsStr(s.paints || [])}`;
       else if (s.type === 'effect') desc = `effect ${(s.effects || []).map(effectStr).join(' + ')}`;
-      out.push(`- \`${name}\`: ${desc}`);
+      const t = tokenTarget(MAP, name);
+      out.push(`- \`${name}\`: ${desc}${t ? ` ⇒ ${targetStr(t)}` : ''}`);
     }
     out.push('');
   }

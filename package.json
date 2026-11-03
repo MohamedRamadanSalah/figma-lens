@@ -1,10 +1,13 @@
 {
   "name": "figma-lens",
-  "version": "0.1.0",
-  "description": "Let Claude Code see Figma designs accurately without the Figma MCP or Dev Mode: a Figma plugin + local bridge that exports layout specs, tokens, screenshots and icons.",
+  "version": "0.2.0",
+  "description": "Let Claude Code see Figma designs accurately without the Figma MCP or Dev Mode: a Figma plugin + local bridge that exports layout specs, tokens, screenshots and icons, plus a compare-and-fix loop and a component map.",
   "license": "MIT",
   "type": "module",
   "private": true,
+  "bin": {
+    "figma-lens": "bin/figma-lens.js"
+  },
   "scripts": {
     "build": "tsc --noEmit -p . && esbuild plugin/src/code.ts --bundle --format=iife --target=es2017 --outfile=plugin/dist/code.js",
     "watch": "esbuild plugin/src/code.ts --bundle --format=iife --target=es2017 --outfile=plugin/dist/code.js --watch",
@@ -13,6 +16,9 @@
     "test": "npm run build && node --test"
   },
   "dependencies": {
+    "gifenc": "^1.0.3",
+    "pixelmatch": "^7.2.0",
+    "playwright-core": "^1.64.1",
     "pngjs": "^7.0.0"
   },
   "devDependencies": {

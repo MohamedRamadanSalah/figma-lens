@@ -7,8 +7,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PNG } from 'pngjs';
 import { renderMarkdown, summarizeUsage } from './render-md.js';
+import { findMap, loadMap } from '../tools/map.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const MARKER = '.figma-lens.json';
 const MAX_BODY = 300 * 1024 * 1024;
 const SAFE_FILE = /^[A-Za-z0-9][A-Za-z0-9._@-]*(\/[A-Za-z0-9][A-Za-z0-9._@-]*)*$/;
@@ -107,7 +108,18 @@ async function writeIndex(outRoot) {
   await fs.writeFile(path.join(outRoot, 'INDEX.md'), lines.join('\n'));
 }
 
-export async function writeExport(outRoot, payload) {
+// Map is re-read on every export so edits apply without restarting the bridge.
+// A broken map must not block exports: warn and continue without it.
+function mapFor(outRoot, mapFile, warnings) {
+  try {
+    return loadMap(mapFile || findMap([outRoot, path.dirname(outRoot)]));
+  } catch (e) {
+    warnings.push(`component map ignored: ${e.message}`);
+    return null;
+  }
+}
+
+export async function writeExport(outRoot, payload, { mapFile } = {}) {
   const { meta, spec, tokens, files } = payload || {};
   if (!meta || !spec || !Array.isArray(files)) throw new HttpError(400, 'payload needs meta, spec and files[]');
   if (meta.tool !== 'figma-lens') throw new HttpError(400, 'not a figma-lens payload');
@@ -165,9 +177,10 @@ export async function writeExport(outRoot, payload) {
   meta.sectionFiles = sectionFiles.map(({ file, id, name, box }) => ({ file, id, name, box }));
 
   const usage = summarizeUsage(spec);
+  const map = mapFor(outRoot, mapFile, meta.warnings);
   await fs.writeFile(path.join(dir, 'spec.json'), JSON.stringify({ meta, spec }, null, 1));
   await fs.writeFile(path.join(dir, 'tokens.json'), JSON.stringify({ ...(tokens || {}), usage }, null, 1));
-  await fs.writeFile(path.join(dir, 'spec.md'), renderMarkdown({ meta, spec, tokens }, usage));
+  await fs.writeFile(path.join(dir, 'spec.md'), renderMarkdown({ meta, spec, tokens }, usage, map));
   const { warnings, sections, sectionFiles: _sf, ...markerMeta } = meta;
   await fs.writeFile(path.join(dir, MARKER), JSON.stringify(markerMeta, null, 1));
   await writeIndex(outRoot);
@@ -206,7 +219,7 @@ export function originAllowed(origin) {
   return /^https:\/\/([a-z0-9-]+\.)*figma\.com$/.test(origin);
 }
 
-export function createBridge({ outRoot, log = console.log } = {}) {
+export function createBridge({ outRoot, mapFile, log = console.log } = {}) {
   const root = path.resolve(outRoot || 'design');
   return http.createServer(async (req, res) => {
     const origin = req.headers.origin;
@@ -237,7 +250,7 @@ export function createBridge({ outRoot, log = console.log } = {}) {
         } catch {
           throw new HttpError(400, 'body is not valid JSON');
         }
-        const result = await writeExport(root, payload);
+        const result = await writeExport(root, payload, { mapFile });
         log(`✔ ${payload.meta.nodeName} → ${result.dir} (${result.files} files)`);
         send(res, 200, { ok: true, ...result });
         return;
@@ -257,16 +270,17 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--out') out.out = argv[++i];
     else if (argv[i] === '--port') out.port = Number(argv[++i]);
+    else if (argv[i] === '--map') out.map = argv[++i];
   }
   return out;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const args = parseArgs(process.argv.slice(2));
-  const port = args.port || Number(process.env.FIGMA_LENS_PORT) || 4141;
-  const outRoot = path.resolve(args.out || process.env.FIGMA_LENS_OUT || 'design');
+export function startBridge({ port, out, map } = {}) {
+  port = port || Number(process.env.FIGMA_LENS_PORT) || 4141;
+  const outRoot = path.resolve(out || process.env.FIGMA_LENS_OUT || 'design');
+  const mapFile = map ? path.resolve(map) : undefined;
   // Loopback only (never the LAN). Figma may resolve "localhost" to IPv4 or IPv6, so bind both.
-  createBridge({ outRoot })
+  createBridge({ outRoot, mapFile })
     .on('error', (e) => {
       console.error(`cannot listen on 127.0.0.1:${port}: ${e.message}`);
       process.exit(1);
@@ -274,10 +288,15 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     .listen(port, '127.0.0.1', () => {
       console.log(`figma-lens bridge ${VERSION} on http://localhost:${port}`);
       console.log(`writing exports to ${outRoot}`);
+      console.log(`component map: ${mapFile || findMap([outRoot, path.dirname(outRoot)]) || '(none yet — run figma-lens map)'}`);
     });
-  createBridge({ outRoot })
+  createBridge({ outRoot, mapFile })
     .on('error', () => {
       // IPv6 loopback unavailable; IPv4 is enough
     })
     .listen(port, '::1');
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  startBridge(parseArgs(process.argv.slice(2)));
 }

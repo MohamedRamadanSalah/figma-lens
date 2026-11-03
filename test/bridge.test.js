@@ -72,16 +72,20 @@ function payload(overrides = {}) {
   };
 }
 
+// Each test gets its own project folder: <tmp>/project/design is the out dir, so a
+// figma-lens.map.json in <tmp>/project is isolated from other tests.
 async function withBridge(fn) {
-  const outRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'figma-lens-'));
+  const project = await fs.mkdtemp(path.join(os.tmpdir(), 'figma-lens-'));
+  const outRoot = path.join(project, 'design');
+  await fs.mkdir(outRoot);
   const server = createBridge({ outRoot, log: () => {} });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
-    await fn({ base, outRoot });
+    await fn({ base, outRoot, project });
   } finally {
     server.close();
-    await fs.rm(outRoot, { recursive: true, force: true });
+    await fs.rm(project, { recursive: true, force: true });
   }
 }
 
@@ -179,6 +183,21 @@ test('screenshot that does not match frame size: warn and skip crops instead of 
     await assert.rejects(fs.access(path.join(dir, 'sections')));
     const md = await fs.readFile(path.join(dir, 'spec.md'), 'utf8');
     assert.match(md, /screenshot is 800×1700px but the frame at 2x should be 780×1688px/);
+  });
+});
+
+test('bridge applies the component map from the project folder; a broken map only warns', async () => {
+  await withBridge(async ({ base, outRoot, project }) => {
+    const mapFile = path.join(project, 'figma-lens.map.json');
+    await fs.writeFile(mapFile, JSON.stringify({ components: { Button: { flutter: 'lib/widgets/app_button.dart#AppButton' } } }));
+    assert.equal((await post(base, payload())).status, 200);
+    let md = await fs.readFile(path.join(outRoot, 'login-screen', 'spec.md'), 'utf8');
+    assert.match(md, /component Button \{Type=Primary, Size=L\} props\{Label="Continue"\} ⇒ USE flutter: lib\/widgets\/app_button\.dart#AppButton/);
+
+    await fs.writeFile(mapFile, '{ broken');
+    assert.equal((await post(base, payload())).status, 200);
+    md = await fs.readFile(path.join(outRoot, 'login-screen', 'spec.md'), 'utf8');
+    assert.match(md, /component map ignored: .*not valid JSON/);
   });
 });
 
