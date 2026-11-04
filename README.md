@@ -2,7 +2,7 @@
 
 Let Claude Code (or any coding agent) **see Figma designs accurately**, **check its own result against them**, and **reuse your real widgets**, without the Figma MCP, the REST API or Dev Mode.
 
-1. **Export:** a Figma plugin reads the frame you select. A local bridge writes everything an agent needs to implement it in Flutter or on the web.
+1. **Export:** a Figma plugin reads the frame you select. A local bridge writes everything an agent needs to implement it in Flutter or on the web for any technology.
 2. **Compare-and-fix loop:** `figma-lens check` screenshots what the agent built, diffs it against the Figma render, and names the Figma layers that differ, so the agent can fix them and re-check.
 3. **Component map:** `figma-lens.map.json` ties Figma components and tokens to your real code (`Button → lib/widgets/app_button.dart#AppButton`), so the agent reuses them instead of rebuilding them.
 
