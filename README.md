@@ -107,11 +107,58 @@ figma-lens demo --design design/login-screen --before first-build.png --after fi
 
 This writes `demo/demo.gif` (first build → fixed build) and `demo/before-after.png`. Each frame is Figma | build | diff; the bars are blue = Figma, red = first build, green = fixed build, pink = diff.
 
+## Auto mode: export → implemented, with one click
+
+With auto mode on, every **Export to Claude** is followed by Claude Code implementing that frame in your project, with nobody typing a prompt. You review the result as a branch.
+
+**Set up once, in your project root (a git repository):**
+
+```bash
+figma-lens auto --init            # writes figma-lens.config.json
+figma-lens map --design design    # optional but recommended: map Figma components to your widgets
+figma-lens bridge --out design --auto
+```
+
+Edit `figma-lens.config.json`:
+
+```json
+{
+  "auto": {
+    "enabled": true,
+    "devServer": "npm run dev -- --port {port}",
+    "url": "http://localhost:{port}/",
+    "instructions": "Screens live in src/pages/<name>/; reuse components from src/components.",
+    "maxBudgetUsd": 5,
+    "timeoutMinutes": 60
+  }
+}
+```
+
+Describe your architecture in `instructions` or, better, in the project's `CLAUDE.md` (where screens go, state management, routing, naming). That is how Claude puts the screen where it belongs.
+
+**What happens on each export:**
+1. The bridge answers the plugin right away, then queues the frame. Frames run one at a time, and a frame that is already waiting is not queued twice.
+2. It creates a git worktree next to your project (`<project>-figma/<frame>`) on branch `figma/<frame>`, made from your **last commit**. Your checkout, your current branch and your uncommitted work are never touched.
+3. It runs `claude -p` there with the figma-lens skill, your CLAUDE.md, the component map and the compare loop (`check` until ≤ 3%).
+4. Results go to `design/<frame>/auto/`: `run.json` (status, branch, cost, changed files), `report.md` (written by Claude: what it built, final mismatch, what it guessed, what you must decide) and `claude.json` (raw output).
+
+Statuses: `done` (finished and changed files), `no-changes` (finished without building, see the report), `budget-exceeded`, `failed`, `skipped` (for example, the project isn't a git repo or has no commit yet).
+
+**Guards:**
+- It never commits, pushes, switches branches, resets or runs `rm`. These are blocked for Claude, not just discouraged. You review the branch and merge it yourself.
+- `maxBudgetUsd` caps each run and `timeoutMinutes` stops a stuck one. A run costs about $0.30 before any real work (loading context), so budgets under about $3 usually end in `no-changes`.
+- Hooks are off in auto runs (they would wait for answers nobody can give). Set `"hooks": true` to keep them.
+- Text in the design is treated as data, never as instructions.
+- This is a guard, not a sandbox: Claude runs your project's own tools (npm, flutter…) inside the worktree.
+
+`figma-lens auto --design design/<frame> --dry-run` prints the exact command, folder and prompt without running anything. Leave out `--dry-run` to retry a frame by hand. Re-running a frame reuses its worktree and branch. When you're done with one, remove it with `git worktree remove ../<project>-figma/<frame>`.
+
 ## All commands
 
 | Command | What it does |
 |---|---|
-| `figma-lens bridge [--out design] [--port 4141] [--map file]` | Receives exports from the plugin |
+| `figma-lens bridge [--out design] [--port 4141] [--map file] [--auto]` | Receives exports from the plugin; with `--auto`, Claude implements each one on a branch |
+| `figma-lens auto --init` / `auto --design <dir> [--dry-run]` | Create the auto-mode config / run or preview one auto job |
 | `figma-lens check --design <dir> (--url <url> \| --adb)` | Screenshot + compare in one step |
 | `figma-lens shot --design <dir> --url <url>` / `--adb --out shot.png` | Screenshot only |
 | `figma-lens compare --design <dir> --actual <png>` | Compare an existing screenshot |

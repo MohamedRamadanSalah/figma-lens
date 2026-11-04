@@ -8,12 +8,20 @@ import { compare } from '../tools/compare.js';
 import { shotWeb, shotAdb } from '../tools/shot.js';
 import { initMap, loadMap, findMap, MAP_FILE } from '../tools/map.js';
 import { makeDemo } from '../tools/demo.js';
+import { findConfig, prepareJob, runJob, CONFIG_FILE, CONFIG_TEMPLATE } from '../tools/auto.js';
 
 const HELP = `figma-lens — let coding agents see Figma designs accurately
 
 Usage:
-  figma-lens bridge  [--out design] [--port 4141] [--map figma-lens.map.json]
-      Receive exports from the Figma plugin.
+  figma-lens bridge  [--out design] [--port 4141] [--map figma-lens.map.json] [--auto]
+      Receive exports from the Figma plugin. With --auto (and auto.enabled in ${CONFIG_FILE}),
+      every export is then implemented by Claude Code, one at a time, in a git worktree on
+      branch figma/<frame>. It never commits or pushes: you review the branch.
+
+  figma-lens auto    --init
+      Write a starter ${CONFIG_FILE} in the current folder (your project root).
+  figma-lens auto    --design design/<frame> [--config ${CONFIG_FILE}] [--dry-run]
+      Run (or with --dry-run: only print) the Claude Code job for one export, e.g. to retry it.
 
   figma-lens check   --design design/<frame> (--url <page url> | --adb) [--viewport] [--crop-top px] [--crop-bottom px] [--fail-above pct]
       Screenshot the build and compare it with the Figma frame (shot + compare in one step).
@@ -43,7 +51,7 @@ Usage:
 function parse(argv) {
   const flags = {};
   const pos = [];
-  const bool = new Set(['full', 'viewport', 'adb', 'json', 'help']);
+  const bool = new Set(['full', 'viewport', 'adb', 'json', 'help', 'auto', 'init', 'dry-run']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith('--')) {
@@ -120,8 +128,37 @@ async function main() {
 
   switch (cmd) {
     case 'bridge':
-      startBridge({ out: flags.out, port: flags.port && Number(flags.port), map: flags.map });
+      startBridge({ out: flags.out, port: flags.port && Number(flags.port), map: flags.map, auto: !!flags.auto });
       return;
+
+    case 'auto': {
+      if (flags.init) {
+        const file = path.resolve(CONFIG_FILE);
+        if (fs.existsSync(file)) throw new Error(`${file} already exists`);
+        fs.writeFileSync(file, JSON.stringify(CONFIG_TEMPLATE, null, 2) + '\n');
+        console.log(`wrote ${file} — edit devServer, url and instructions for this project, then run: figma-lens bridge --auto`);
+        return;
+      }
+      const designDir = needDesign(flags);
+      const configFile = flags.config
+        ? path.resolve(flags.config)
+        : findConfig([path.dirname(designDir), path.dirname(path.dirname(designDir)), process.cwd()]);
+      if (!configFile) throw new Error(`no ${CONFIG_FILE} found near ${designDir} (run figma-lens auto --init in your project)`);
+      if (flags['dry-run']) {
+        const job = prepareJob({ frameDir: designDir, configFile });
+        console.log(`config:   ${configFile}`);
+        console.log(`branch:   ${job.plan.branch}`);
+        console.log(`worktree: ${job.plan.worktree}  (not created in a dry run)`);
+        console.log(`cwd:      ${job.plan.workDir}`);
+        console.log(`command:  ${[job.cmd, ...job.args].map((a) => (/[\s"*()]/.test(a) ? JSON.stringify(a) : a)).join(' ')}`);
+        console.log('prompt (sent on stdin):');
+        console.log(job.prompt);
+        return;
+      }
+      const run = await runJob({ frameDir: designDir, configFile });
+      if (run.status !== 'done') process.exitCode = 1;
+      return;
+    }
 
     case 'shot': {
       const designDir = flags.adb ? null : needDesign(flags);

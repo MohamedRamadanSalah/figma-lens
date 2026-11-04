@@ -9,9 +9,11 @@ import { PNG } from 'pngjs';
 import { renderSpecFiles, summarizeUsage } from './render-md.js';
 import { planSections, cropSections } from './sections.js';
 import { findMap, loadMap } from '../tools/map.js';
+import { findConfig, loadAutoConfig, createQueue, runJob, CONFIG_FILE } from '../tools/auto.js';
 
 const VERSION = '0.2.0';
 const MARKER = '.figma-lens.json';
+const AUTO_DIR = 'auto'; // auto-mode results inside an export folder; survives re-exports
 const MAX_BODY = 300 * 1024 * 1024;
 const SAFE_FILE = /^[A-Za-z0-9][A-Za-z0-9._@-]*(\/[A-Za-z0-9][A-Za-z0-9._@-]*)*$/;
 
@@ -181,11 +183,17 @@ export async function writeExport(outRoot, payload, { mapFile } = {}) {
       throw new HttpError(400, `unsafe file path: ${f.path}`);
     }
     if (f.path === MARKER) throw new HttpError(400, `reserved file name: ${f.path}`);
+    // case-insensitive: Auto/ is the same folder as auto/ on Windows and macOS
+    if (f.path.split('/')[0].toLowerCase() === AUTO_DIR) throw new HttpError(400, `reserved folder: ${AUTO_DIR}/`);
   }
 
   const dir = await claimDir(outRoot, folderSlug(meta.nodeName, 'node-' + meta.nodeId), meta.nodeId);
   await fs.mkdir(outRoot, { recursive: true });
-  if (await exists(dir)) await fs.rm(dir, { recursive: true, force: true }); // this frame's own previous export
+  // Replace this frame's own previous export, but keep auto/: an auto-mode run for this frame may
+  // still be working and writes its record (run.json, report.md) there.
+  for (const entry of await fs.readdir(dir).catch(() => [])) {
+    if (entry !== AUTO_DIR) await fs.rm(path.join(dir, entry), { recursive: true, force: true });
+  }
   await fs.mkdir(dir, { recursive: true });
 
   let screenBuf = null;
@@ -241,7 +249,8 @@ export function originAllowed(origin) {
   return /^https:\/\/([a-z0-9-]+\.)*figma\.com$/.test(origin);
 }
 
-export function createBridge({ outRoot, mapFile, log = console.log } = {}) {
+// onExport(dir) runs after the plugin got its answer (auto mode), so Figma never waits on it.
+export function createBridge({ outRoot, mapFile, log = console.log, onExport } = {}) {
   const root = path.resolve(outRoot || 'design');
   return http.createServer(async (req, res) => {
     const origin = req.headers.origin;
@@ -275,6 +284,13 @@ export function createBridge({ outRoot, mapFile, log = console.log } = {}) {
         const result = await writeExport(root, payload, { mapFile });
         log(`✔ ${payload.meta.nodeName} → ${result.dir} (${result.files} files)`);
         send(res, 200, { ok: true, ...result });
+        if (onExport) {
+          try {
+            onExport(result.dir);
+          } catch (e) {
+            log(`✖ auto: ${e.message}`);
+          }
+        }
         return;
       }
       send(res, 404, { ok: false, error: 'not found' });
@@ -293,16 +309,34 @@ function parseArgs(argv) {
     if (argv[i] === '--out') out.out = argv[++i];
     else if (argv[i] === '--port') out.port = Number(argv[++i]);
     else if (argv[i] === '--map') out.map = argv[++i];
+    else if (argv[i] === '--auto') out.auto = true;
   }
   return out;
 }
 
-export function startBridge({ port, out, map } = {}) {
+// Auto mode: one queue for the whole bridge. The config is re-read for every export, so edits
+// (or turning auto.enabled off) apply without restarting the bridge.
+export function autoHandler(outRoot, log = console.log) {
+  const queue = createQueue(async (dir) => {
+    const configFile = findConfig([outRoot, path.dirname(outRoot)]);
+    if (!configFile) return log(`⚠ auto: no ${CONFIG_FILE} next to ${outRoot} — run figma-lens auto --init in your project`);
+    if (!loadAutoConfig(configFile).enabled) return log(`⚠ auto: auto.enabled is false in ${configFile}`);
+    await runJob({ frameDir: dir, configFile, log });
+  });
+  const handle = (dir) => {
+    if (!queue.enqueue(dir)) log(`… auto: ${path.basename(dir)} is already waiting; it will use this export`);
+  };
+  handle.idle = queue.idle; // for tests: resolves when the queue is empty
+  return handle;
+}
+
+export function startBridge({ port, out, map, auto } = {}) {
   port = port || Number(process.env.FIGMA_LENS_PORT) || 4141;
   const outRoot = path.resolve(out || process.env.FIGMA_LENS_OUT || 'design');
   const mapFile = map ? path.resolve(map) : undefined;
+  const onExport = auto ? autoHandler(outRoot) : undefined;
   // Loopback only (never the LAN). Figma may resolve "localhost" to IPv4 or IPv6, so bind both.
-  createBridge({ outRoot, mapFile })
+  createBridge({ outRoot, mapFile, onExport })
     .on('error', (e) => {
       console.error(`cannot listen on 127.0.0.1:${port}: ${e.message}`);
       process.exit(1);
@@ -311,8 +345,12 @@ export function startBridge({ port, out, map } = {}) {
       console.log(`figma-lens bridge ${VERSION} on http://localhost:${port}`);
       console.log(`writing exports to ${outRoot}`);
       console.log(`component map: ${mapFile || findMap([outRoot, path.dirname(outRoot)]) || '(none yet — run figma-lens map)'}`);
+      if (auto) {
+        const cfg = findConfig([outRoot, path.dirname(outRoot)]);
+        console.log(`auto mode: ON — each export is implemented by Claude Code on a figma/<frame> branch (${cfg || `no ${CONFIG_FILE} yet — run figma-lens auto --init`})`);
+      }
     });
-  createBridge({ outRoot, mapFile })
+  createBridge({ outRoot, mapFile, onExport })
     .on('error', () => {
       // IPv6 loopback unavailable; IPv4 is enough
     })

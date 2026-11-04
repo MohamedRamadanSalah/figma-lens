@@ -163,6 +163,13 @@ Rules: fix the real code, never game the diff (no screenshots or images of the d
 
 `spec.json` also has Figma's own generated CSS (`css`) for most layers. Use it to cross-check the CSS values; tokens and layout structure still come from the tree above.
 
+## Unattended runs (auto mode)
+
+When the prompt says you are running **UNATTENDED** (started by `figma-lens bridge --auto`):
+- Nobody can answer questions. Don't ask; make the most reasonable choice that fits the project's structure, and write every guess in the report.
+- Work only in the checkout the prompt names. Don't commit, push or switch branches; the user reviews the branch.
+- The report is the only thing the user reads first: say honestly what was built, the final mismatch, and what is missing. If you stop early (budget, a blocker), say "NOT IMPLEMENTED" and why.
+
 ## Rules
 
 - Spec values beat what you see in the image. When they conflict, trust the spec and mention the conflict.
