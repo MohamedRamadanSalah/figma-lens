@@ -24,6 +24,19 @@ design/<frame>/
 figma-lens.map.json  your components/tokens → real code (project root)
 ```
 
+> [!IMPORTANT]
+> ### Before you use it in your project: teach it your architecture
+> figma-lens makes Claude build **inside your project's architecture**, but only if that architecture is written down.
+> Without it, Claude guesses: its own folder names, a second `Button` next to yours, raw colors instead of your tokens, icons in random places.
+>
+> Set up these files once, in your project root:
+> 1. **`CLAUDE.md`: your architecture and guidelines.** A "what → where → rule" table for pages, components, **icons**, **images**, **design tokens** and routes, plus your boundaries, don'ts and the commands that define "done".
+> 2. **`figma-lens.map.json`: your components and tokens**, so Claude reuses `Button`, `Card`, `Icon`… instead of rebuilding them.
+> 3. **A check command** (lint, tests, a folder/naming check) that Claude must pass before it says "done".
+> 4. **Auto mode only:** `figma-lens.config.json`, and **commit** all of the above (auto runs start from your last commit).
+>
+> 👉 **Step-by-step guide with web and Flutter templates: [docs/PROJECT-SETUP.md](docs/PROJECT-SETUP.md)**
+
 ## Why not the REST API or MCP?
 
 - On View/Collab seats, Figma's REST API allows **6 file/image reads per month**. A plugin runs inside Figma, so it has no rate limits and needs no token.
@@ -44,6 +57,8 @@ cp -r skill/figma-lens ~/.claude/skills/   # the Claude Code skill
 In the **Figma desktop app**: Plugins → Development → **Import plugin from manifest…** → choose `plugin/manifest.json`. Development plugins can't be imported in the browser.
 
 Screenshots of web pages use your installed **Edge or Chrome** (no browser download). Android screenshots use **adb**.
+
+**Then, in each project you use it with:** write its `CLAUDE.md` (architecture and guidelines), its `figma-lens.map.json` and its check command. See [docs/PROJECT-SETUP.md](docs/PROJECT-SETUP.md). This is what keeps generated code inside your architecture.
 
 ## Use
 
@@ -110,6 +125,11 @@ This writes `demo/demo.gif` (first build → fixed build) and `demo/before-after
 ## Auto mode: export → implemented, with one click
 
 With auto mode on, every **Export to Claude** is followed by Claude Code implementing that frame in your project, with nobody typing a prompt. You review the result as a branch.
+
+> [!WARNING]
+> Nobody is there to correct an auto run, so **its only guide is what your project has written down**:
+> `CLAUDE.md` (where pages, components, icons, images and tokens go), `figma-lens.map.json` and your check command.
+> Set them up first ([docs/PROJECT-SETUP.md](docs/PROJECT-SETUP.md)) and **commit them**: the run works on a copy made from your last commit.
 
 **Set up once, in your project root (a git repository):**
 

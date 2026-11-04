@@ -137,6 +137,13 @@ async function main() {
         if (fs.existsSync(file)) throw new Error(`${file} already exists`);
         fs.writeFileSync(file, JSON.stringify(CONFIG_TEMPLATE, null, 2) + '\n');
         console.log(`wrote ${file} — edit devServer, url and instructions for this project, then run: figma-lens bridge --auto`);
+        // Claude Code reads project rules from ./CLAUDE.md or ./.claude/CLAUDE.md
+        if (!['CLAUDE.md', path.join('.claude', 'CLAUDE.md')].some((f) => fs.existsSync(path.resolve(f)))) {
+          console.log('');
+          console.log('⚠ No CLAUDE.md here. Auto runs follow ONLY what your project writes down: add a CLAUDE.md with your');
+          console.log('  architecture (where pages, components, icons, images and tokens go) and commit it before exporting.');
+          console.log('  Guide + templates: https://github.com/MohamedRamadanSalah/figma-lens/blob/main/docs/PROJECT-SETUP.md');
+        }
         return;
       }
       const designDir = needDesign(flags);

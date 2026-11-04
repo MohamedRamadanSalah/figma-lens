@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { runJob, createQueue, statusFrom, createProgress, describeTool } from '../tools/auto.js';
+import { fileURLToPath } from 'node:url';
+import { runJob, createQueue, statusFrom, createProgress, describeTool, explainFailure, buildPrompt } from '../tools/auto.js';
 import { createBridge, autoHandler } from '../bridge/server.js';
 
 // A stand-in for Claude Code: records what it was given, "builds" a file in its cwd,
@@ -111,6 +112,10 @@ test('re-running the same export reuses its worktree and branch', async () => {
   await runJob({ frameDir: p.frameDir, configFile: p.config, log: quiet });
   const again = await runJob({ frameDir: p.frameDir, configFile: p.config, log: quiet });
   assert.equal(again.status, 'done', JSON.stringify(again));
+  // the first run FINISHED: Claude is told to update that work, not that it was cut off
+  const second = p.calls()[1].prompt;
+  assert.match(second, /already built this frame in this checkout/);
+  assert.doesNotMatch(second, /stopped before finishing/);
   const trees = git(['worktree', 'list', '--porcelain'], p.proj).split('\n').filter((l) => l.startsWith('worktree '));
   assert.equal(trees.length, 2); // the user's checkout + one figma worktree
 });
@@ -123,7 +128,10 @@ test('a run that stops with an error is never reported as done; a stale report i
   fs.writeFileSync(path.join(p.root, 'fake-claude.cjs'), FAKE.replace("if (m) fs.writeFileSync(m[1], '# report');", ''));
   const run = await runJob({ frameDir: p.frameDir, configFile: p.config, log: quiet });
   assert.equal(run.status, 'failed');
-  assert.equal(run.report, null, "the previous run's report must not count for this run");
+  // the previous run's report must not count for this run: figma-lens writes a NOT FINISHED report instead
+  const report = fs.readFileSync(path.join(p.frameDir, 'auto', 'report.md'), 'utf8');
+  assert.match(report, /^# NOT FINISHED: home/);
+  assert.doesNotMatch(report, /^# report/);
 
   assert.equal(statusFrom(null, 0), 'failed');
   assert.equal(statusFrom({ subtype: 'success', is_error: false }, 1), 'failed');
@@ -219,6 +227,82 @@ test('progress parser: events split across chunks, non-JSON noise, errors, and t
   assert.equal(label('npm start'), 'starting the dev server');
   assert.equal(label('pnpm dev --port 5180'), 'starting the dev server');
   assert.equal(describeTool('TodoWrite', { todos: [{ status: 'completed', content: 'a' }, { status: 'in_progress', content: 'b', activeForm: 'Building the hero' }] }), 'step: Building the hero');
+});
+
+test('a run cut off by API timeouts explains itself: problem, cause, partial files, retry/discard commands', async () => {
+  const p = makeProject();
+  // Claude opened 4 images, the API kept retrying, then "Request timed out" (the html-body failure).
+  const failing = `
+const fs = require('fs'); const path = require('path');
+let prompt = ''; process.stdin.on('data', (c) => (prompt += c)); process.stdin.on('end', () => {
+  fs.writeFileSync('half-built.txt', 'x');
+  const frame = prompt.match(/Design export: (.+)/)[1].trim();
+  const ev = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+  for (let i = 1; i <= 4; i++) ev({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: path.join(frame, 'sections', '0' + i + '-s.png') } }] } });
+  for (let a = 1; a <= 5; a++) ev({ type: 'system', subtype: 'api_retry', attempt: a, max_retries: 10, error: 'unknown' });
+  ev({ type: 'result', subtype: 'success', is_error: true, num_turns: 43, result: 'Request timed out' });
+  process.exit(1);
+});`;
+  fs.writeFileSync(path.join(p.root, 'fake-claude.cjs'), failing);
+  const logs = [];
+  const run = await runJob({ frameDir: p.frameDir, configFile: p.config, log: (m) => logs.push(m) });
+  const text = logs.join('\n');
+
+  assert.equal(run.status, 'failed');
+  assert.match(run.problem, /API stopped answering .*Request timed out.* after 5 retries/);
+  assert.match(text, /⚠ Claude's API is not answering \(retry 3\/10\)/); // live progress showed the retries
+  assert.match(text, /why: Claude had opened 4 images/);
+  assert.match(text, /left behind: 1 changed file\(s\) on figma\/home/);
+  assert.match(text, /next: check your internet connection/);
+  assert.match(text, /auto --design ".*home"/); // the exact retry command
+  assert.doesNotMatch(text, /review branch/); // nothing finished to review
+  // every command line is copy-pasteable as is: no &&, never two git commands on one line
+  for (const t of run.todo) {
+    assert.doesNotMatch(t, /&&/);
+    assert.ok((t.match(/\bgit -C\b/g) || []).length <= 1, `two commands on one line: ${t}`);
+  }
+  assert.ok(run.todo.some((t) => /^then: git -C .* branch -D figma\/home$/.test(t)), run.todo.join('\n'));
+
+  const report = fs.readFileSync(path.join(p.frameDir, 'auto', 'report.md'), 'utf8');
+  assert.match(report, /^# NOT FINISHED: home/);
+  assert.match(report, /half-built\.txt/);
+  assert.match(report, /partial work/);
+
+  // retrying the same export tells Claude to continue from the partial work
+  fs.writeFileSync(path.join(p.root, 'fake-claude.cjs'), FAKE);
+  await runJob({ frameDir: p.frameDir, configFile: p.config, log: quiet });
+  assert.match(p.calls().at(-1).prompt, /previous run on this branch stopped before finishing/);
+});
+
+test('failure explanations for the common causes', () => {
+  const base = { status: 'failed', retryCmd: 'R', discardCmd: 'D', timeoutMinutes: 45 };
+  assert.match(explainFailure({ ...base, reason: 'Claude AI usage limit reached|1730000000' }).problem, /usage limit was reached/);
+  assert.match(explainFailure({ ...base, reason: 'Invalid API key · Please run /login' }).problem, /not logged in/);
+  assert.match(explainFailure({ ...base, timedOut: true, reason: 'stopped after 45 minutes' }).problem, /after 45 minutes \(auto\.timeoutMinutes\)/);
+  assert.match(explainFailure({ ...base, exitCode: -1, reason: 'spawn ENOENT' }).problem, /could not start/);
+  assert.match(explainFailure({ ...base, status: 'no-changes' }).problem, /without changing any file/);
+  assert.match(explainFailure({ ...base, reason: 'Request timed out', imagesRead: 1 }).cause, /network problem or the Claude service being busy/);
+});
+
+test('large frames get the one-image-at-a-time rule in the prompt', () => {
+  const args = { frameDir: '/d/f', meta: { nodeName: 'X', width: 1, height: 1 }, plan: { workDir: '/w', branch: 'figma/x' }, mapFile: null, cfg: {} };
+  assert.match(buildPrompt({ ...args, large: true }), /LARGE FRAME.*ONE AT A TIME/);
+  assert.doesNotMatch(buildPrompt(args), /LARGE FRAME/);
+});
+
+test('auto --init warns only when the project has no CLAUDE.md (root or .claude/)', () => {
+  const cli = fileURLToPath(new URL('../bin/figma-lens.js', import.meta.url));
+  const warned = (setup) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'figma-lens-init-'));
+    setup(dir);
+    const r = spawnSync(process.execPath, [cli, 'auto', '--init'], { cwd: dir, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(fs.existsSync(path.join(dir, 'figma-lens.config.json')));
+    return /No CLAUDE\.md/.test(r.stdout);
+  };
+  assert.equal(warned(() => {}), true);
+  assert.equal(warned((d) => fs.writeFileSync(path.join(d, 'CLAUDE.md'), '# rules')), false);
+  assert.equal(warned((d) => { fs.mkdirSync(path.join(d, '.claude')); fs.writeFileSync(path.join(d, '.claude', 'CLAUDE.md'), '# rules'); }), false);
 });
 
 test('queue: one job at a time, in order; an export already waiting is not queued twice', async () => {
