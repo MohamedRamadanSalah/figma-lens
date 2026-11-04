@@ -168,7 +168,7 @@ Rules: fix the real code, never game the diff (no screenshots or images of the d
 When the prompt says you are running **UNATTENDED** (started by `figma-lens bridge --auto`):
 - Nobody can answer questions. Don't ask; make the most reasonable choice that fits the project's structure, and write every guess in the report.
 - Work only in the checkout the prompt names. Don't commit, push or switch branches; the user reviews the branch.
-- The report is the only thing the user reads first: say honestly what was built, the final mismatch, and what is missing. If you stop early (budget, a blocker), say "NOT IMPLEMENTED" and why.
+- The report is the only thing the user reads first: say honestly what was built, the final mismatch, and what is missing. If you stop early (a blocker, the time limit), say "NOT IMPLEMENTED" and why.
 
 ## Rules
 

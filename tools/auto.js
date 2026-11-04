@@ -31,7 +31,6 @@ const DEFAULTS = {
   devServer: '',
   url: '',
   instructions: '',
-  maxBudgetUsd: 5,
   timeoutMinutes: 60,
   worktreeRoot: '',
   allowedTools: null,
@@ -45,7 +44,6 @@ export const CONFIG_TEMPLATE = {
     devServer: 'npm run dev -- --port {port}',
     url: 'http://localhost:{port}/',
     instructions: 'Screens live in src/pages/<name>/; reuse components from src/components. (Describe your architecture here or in CLAUDE.md.)',
-    maxBudgetUsd: 5,
     timeoutMinutes: 60,
   },
 };
@@ -69,7 +67,6 @@ export function loadAutoConfig(file) {
     throw new Error(`${file}: ${e.message}`);
   }
   const auto = { ...DEFAULTS, ...((raw && raw.auto) || {}) };
-  if (!(Number(auto.maxBudgetUsd) > 0)) throw new Error(`${file}: auto.maxBudgetUsd must be a number above 0`);
   if (!(Number(auto.timeoutMinutes) > 0)) throw new Error(`${file}: auto.timeoutMinutes must be a number above 0`);
   if (auto.allowedTools != null && !Array.isArray(auto.allowedTools)) throw new Error(`${file}: auto.allowedTools must be a list`);
   return { ...auto, file, projectDir: path.dirname(path.resolve(file)) };
@@ -176,22 +173,127 @@ export function buildPrompt({ frameDir, meta, plan, mapFile, cfg }) {
 export function claudeArgs({ cfg, frameDir }) {
   const args = [
     '-p',
-    '--output-format', 'json',
+    // stream-json (needs --verbose): one JSON event per line, so the bridge can show live progress
+    '--output-format', 'stream-json', '--verbose',
     '--permission-mode', 'acceptEdits',
-    '--max-budget-usd', String(cfg.maxBudgetUsd),
     '--add-dir', frameDir,
     '--allowedTools', ...(cfg.allowedTools || DEFAULT_ALLOWED_TOOLS),
     '--disallowedTools', ...DENIED_TOOLS,
   ];
-  // Hooks (GateGuard prompts, review Stop hooks) would cost turns in a run nobody can answer.
+  // Hooks (GateGuard prompts, review Stop hooks) would stall a run nobody can answer.
   if (!cfg.hooks) args.push('--settings', JSON.stringify({ disableAllHooks: true }));
   return args;
 }
 
-/** Map the CLI's JSON result to a run status. Only a clean success counts as done. */
+// ---------- live progress ----------
+
+function shortPath(p, roots) {
+  if (!p) return '';
+  const abs = path.resolve(String(p));
+  for (const [label, root] of roots) {
+    const rel = path.relative(root, abs);
+    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) return label + rel.split(path.sep).join('/');
+  }
+  return path.basename(abs);
+}
+
+const clip = (s, n = 90) => {
+  const one = String(s || '').replace(/\s+/g, ' ').trim();
+  return one.length > n ? one.slice(0, n - 1) + '…' : one;
+};
+
+/** One readable line for a tool call, or null to stay quiet. */
+export function describeTool(name, input = {}, roots = []) {
+  const p = (k = 'file_path') => shortPath(input[k], roots);
+  switch (name) {
+    case 'Read': return `reading ${p()}`;
+    case 'Write': return `writing ${p()}`;
+    case 'Edit':
+    case 'MultiEdit': return `editing ${p()}`;
+    case 'Glob': return `looking for ${clip(input.pattern, 60)}`;
+    case 'Grep': return `searching for "${clip(input.pattern, 50)}"`;
+    case 'Skill': return `using the ${input.skill || input.command || ''} skill`;
+    case 'TodoWrite': {
+      const now = (input.todos || []).find((t) => t.status === 'in_progress');
+      return now ? `step: ${clip(now.activeForm || now.content, 80)}` : null;
+    }
+    case 'Bash': {
+      const cmd = String(input.command || '');
+      // Judge each command in a chain by the program it STARTS with, not by words anywhere in it
+      // (otherwise `cat vite.config.ts` reads as "starting the dev server").
+      const parts = cmd
+        .split(/&&|\|\||;|\|/)
+        .map((s) => s.trim().replace(/^(\w+=\S*\s+)+/, '')) // drop env prefixes like PORT=5173
+        .filter(Boolean);
+      const runs = (re) => parts.some((s) => re.test(s));
+      if (runs(/^(node\s+("[^"]*figma-lens(\.js)?"|\S*figma-lens(\.js)?)|(npx\s+)?figma-lens)\s+check(\s|$)/)) return 'comparing the build with Figma (figma-lens check)';
+      // A bare `yarn` installs; `yarn <script>` runs that script, so only `yarn install …` also counts.
+      if (runs(/^(npm (ci|install|i)|pnpm (i|install)|flutter pub get)(\s|$)|^yarn(\s+install(\s.*)?)?$/)) return 'installing dependencies';
+      if (runs(/^((npm|pnpm|yarn) (run )?build|(npx\s+)?vite\s+build|flutter build)(\s|$)/)) return 'building the project';
+      if (runs(/^((npm|pnpm|yarn) (run )?(dev|start)|(npx\s+)?vite|flutter run)(\s|$)/)) return 'starting the dev server';
+      return `running: ${clip(input.description || cmd, 80)}`;
+    }
+    case 'Task':
+    case 'Agent': return `sub-task: ${clip(input.description || input.prompt, 70)}`;
+    default: return name;
+  }
+}
+
+/**
+ * Turns the stream-json events into progress lines and keeps the final result.
+ * feed(chunk) accepts raw stdout; lines may be split across chunks.
+ */
+export function createProgress({ frame, roots, started, log }) {
+  let buf = '';
+  let last = '';
+  let result = null;
+  const say = (text) => {
+    if (!text || text === last) return;
+    last = text;
+    const s = Math.floor((Date.now() - started) / 1000);
+    log(`  [${frame} ${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}] ${text}`);
+  };
+  const onEvent = (ev) => {
+    if (ev.type === 'result') {
+      result = ev;
+      return;
+    }
+    const content = ev.message && Array.isArray(ev.message.content) ? ev.message.content : [];
+    for (const c of content) {
+      if (ev.type === 'assistant' && c.type === 'tool_use') say(describeTool(c.name, c.input, roots));
+      if (ev.type === 'user' && c.type === 'tool_result') {
+        const text = typeof c.content === 'string' ? c.content : (c.content || []).map((x) => x.text || '').join('\n');
+        const score = text.match(/(\d+(?:\.\d+)?)% different/);
+        if (score) say(`check: ${score[1]}% different from Figma`);
+        else if (c.is_error) say(`⚠ ${clip(text.split('\n')[0], 100)}`);
+      }
+    }
+  };
+  return {
+    feed(chunk) {
+      buf += chunk;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (!line) continue;
+        try {
+          onEvent(JSON.parse(line));
+        } catch {
+          // not JSON (e.g. a warning line): ignore for progress, it stays in claude.jsonl
+        }
+      }
+    },
+    end() {
+      if (buf.trim()) this.feed('\n');
+      return result;
+    },
+  };
+}
+
+/** Map the CLI's final result event to a run status. Only a clean success counts as done. */
 export function statusFrom(result, exitCode) {
   if (result && result.subtype === 'success' && !result.is_error && exitCode === 0) return 'done';
-  if (result && /budget/i.test(String(result.subtype))) return 'budget-exceeded';
   return 'failed';
 }
 
@@ -240,7 +342,14 @@ export async function runJob({ frameDir, configFile, log = console.log }) {
   fs.rmSync(path.join(frameDir, 'auto', 'report.md'), { force: true }); // never show last run's report as this run's
   const meta = { ...base, branch: plan.branch, worktree: plan.worktree, workDir: plan.workDir };
   writeRun(frameDir, { ...meta, status: 'running' });
-  log(`▶ auto: implementing ${base.frame} on ${plan.branch} (${plan.worktree}), budget $${cfg.maxBudgetUsd}`);
+  log(`▶ auto: implementing ${base.frame} on ${plan.branch} (${plan.worktree})`);
+  log(`  progress below; details in ${path.join(frameDir, 'auto', 'claude.jsonl')}`);
+  const progress = createProgress({
+    frame: base.frame,
+    roots: [['', plan.workDir], ['export/', frameDir]],
+    started,
+    log,
+  });
 
   const out = await new Promise((resolve) => {
     let stdout = '';
@@ -251,7 +360,15 @@ export async function runJob({ frameDir, configFile, log = console.log }) {
       timedOut = true;
       child.kill();
     }, cfg.timeoutMinutes * 60 * 1000);
-    child.stdout.on('data', (c) => (stdout += c));
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (c) => {
+      stdout += c;
+      try {
+        progress.feed(c);
+      } catch {
+        // progress is cosmetic; never let it break the run
+      }
+    });
     child.stderr.on('data', (c) => (stderr += c));
     child.on('error', (e) => {
       clearTimeout(timer);
@@ -265,10 +382,11 @@ export async function runJob({ frameDir, configFile, log = console.log }) {
     child.stdin.end(job.prompt);
   });
 
+  out.result = progress.end();
   try {
     return finishRun({ frameDir, cfg, plan, meta, out, started, log });
   } catch (e) {
-    // Last resort: the run already happened (and cost money), so never lose its record.
+    // Last resort: the run already happened, so never lose its record.
     const run = { ...meta, status: 'failed', reason: `could not record the result: ${e.message}`, durationMs: Date.now() - started };
     try {
       writeRun(frameDir, run);
@@ -282,14 +400,10 @@ export async function runJob({ frameDir, configFile, log = console.log }) {
 
 function finishRun({ frameDir, cfg, plan, meta, out, started, log }) {
   fs.mkdirSync(path.join(frameDir, 'auto'), { recursive: true }); // a re-export may have replaced the folder meanwhile
-  fs.writeFileSync(path.join(frameDir, 'auto', 'claude.json'), out.stdout || '');
-  let result = null;
-  try {
-    result = JSON.parse(out.stdout);
-  } catch {
-    result = null;
-  }
-  // Claude can end "successfully" without building anything (e.g. it judged the budget too small).
+  fs.writeFileSync(path.join(frameDir, 'auto', 'claude.jsonl'), out.stdout || ''); // every event, for debugging
+  const result = out.result || null; // the final {"type":"result"} event
+  fs.writeFileSync(path.join(frameDir, 'auto', 'claude.json'), result ? JSON.stringify(result, null, 1) : '');
+  // Claude can end "successfully" without building anything (e.g. it hit a blocker).
   // Only real changes in the worktree count as done.
   let changedFiles = null;
   try {
@@ -304,7 +418,6 @@ function finishRun({ frameDir, cfg, plan, meta, out, started, log }) {
     status,
     changedFiles,
     exitCode: out.code,
-    costUsd: result && result.total_cost_usd != null ? result.total_cost_usd : null,
     turns: result ? result.num_turns : null,
     durationMs: Date.now() - started,
     report: fs.existsSync(path.join(frameDir, 'auto', 'report.md')) ? 'auto/report.md' : null,
@@ -317,8 +430,7 @@ function finishRun({ frameDir, cfg, plan, meta, out, started, log }) {
           : String((result && (result.result || result.subtype)) || out.stderr || 'no result').slice(0, 500),
   };
   writeRun(frameDir, run);
-  const cost = run.costUsd != null ? `, $${Number(run.costUsd).toFixed(2)}` : '';
-  log(`${status === 'done' ? '✔' : '✖'} auto: ${meta.frame} ${status}${cost} → review branch ${plan.branch}${run.report ? `, report ${path.join(frameDir, 'auto', 'report.md')}` : ''}`);
+  log(`${status === 'done' ? '✔' : '✖'} auto: ${meta.frame} ${status} → review branch ${plan.branch}${run.report ? `, report ${path.join(frameDir, 'auto', 'report.md')}` : ''}`);
   return run;
 }
 

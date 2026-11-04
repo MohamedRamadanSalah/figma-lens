@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { runJob, createQueue, statusFrom } from '../tools/auto.js';
+import { runJob, createQueue, statusFrom, createProgress, describeTool } from '../tools/auto.js';
 import { createBridge, autoHandler } from '../bridge/server.js';
 
 // A stand-in for Claude Code: records what it was given, "builds" a file in its cwd,
@@ -19,7 +19,15 @@ process.stdin.on('end', () => {
   const m = prompt.match(/Last, write (.+report\\.md):/);
   if (m) fs.writeFileSync(m[1], '# report');
   const subtype = process.env.FAKE_SUBTYPE || 'success';
-  process.stdout.write(JSON.stringify({ type: 'result', subtype, is_error: subtype !== 'success', total_cost_usd: 0.42, num_turns: 7, result: 'ok' }));
+  const frame = (prompt.match(/Design export: (.+)/) || [])[1].trim();
+  const ev = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+  const use = (name, input) => ev({ type: 'assistant', message: { content: [{ type: 'tool_use', name, input }] } });
+  ev({ type: 'system', subtype: 'init' });
+  use('Read', { file_path: require('path').join(frame, 'spec.json') });
+  use('Edit', { file_path: require('path').join(process.cwd(), 'built.txt') });
+  use('Bash', { command: 'node "x/bin/figma-lens.js" check --design "' + frame + '" --url http://localhost:5173/home' });
+  ev({ type: 'user', message: { content: [{ type: 'tool_result', content: 'Home: 2.1% different' }] } });
+  ev({ type: 'result', subtype, is_error: subtype !== 'success', num_turns: 7, result: 'ok' });
   process.exit(Number(process.env.FAKE_EXIT || 0));
 });
 `;
@@ -43,7 +51,7 @@ function makeProject({ withGit = true, enabled = true, frame = 'home' } = {}) {
   }
   const fake = path.join(root, 'fake-claude.cjs');
   fs.writeFileSync(fake, FAKE);
-  fs.writeFileSync(path.join(proj, 'figma-lens.config.json'), JSON.stringify({ auto: { enabled, claude: [process.execPath, fake], maxBudgetUsd: 5 } }));
+  fs.writeFileSync(path.join(proj, 'figma-lens.config.json'), JSON.stringify({ auto: { enabled, claude: [process.execPath, fake] } }));
   fs.writeFileSync(path.join(proj, 'figma-lens.map.json'), '{"components":{},"tokens":{}}'); // untracked, like a real map
   const frameDir = path.join(proj, 'design', frame);
   fs.mkdirSync(frameDir, { recursive: true });
@@ -61,10 +69,18 @@ const quiet = () => {};
 test('auto run: works in a worktree on figma/<folder>, never in the user checkout, and records the result', async () => {
   const p = makeProject();
   const userBranch = git(['branch', '--show-current'], p.proj);
-  const run = await runJob({ frameDir: p.frameDir, configFile: p.config, log: quiet });
+  const logs = [];
+  const run = await runJob({ frameDir: p.frameDir, configFile: p.config, log: (m) => logs.push(m) });
+  // live progress: one readable line per step, with the frame name and elapsed time
+  for (const want of [/\[home \d\d:\d\d\] reading export\/spec\.json/, /editing built\.txt/, /comparing the build with Figma/, /check: 2\.1% different from Figma/]) {
+    assert.ok(logs.some((l) => want.test(l)), `missing progress line ${want}\n${logs.join('\n')}`);
+  }
+  assert.equal(JSON.parse(fs.readFileSync(path.join(p.frameDir, 'auto', 'claude.json'), 'utf8')).type, 'result');
+  assert.ok(fs.existsSync(path.join(p.frameDir, 'auto', 'claude.jsonl')));
   assert.equal(run.status, 'done', JSON.stringify(run));
   assert.equal(run.branch, 'figma/home');
-  assert.equal(run.costUsd, 0.42);
+  assert.equal(run.turns, 7);
+  assert.ok(!('costUsd' in run));
   assert.equal(run.report, 'auto/report.md');
 
   const worktree = path.join(p.root, 'proj-figma', 'home');
@@ -76,7 +92,8 @@ test('auto run: works in a worktree on figma/<folder>, never in the user checkou
   const [call] = p.calls();
   assert.equal(path.resolve(call.cwd).toLowerCase(), path.resolve(worktree).toLowerCase());
   const argv = call.argv;
-  assert.deepEqual(argv.slice(0, 7), ['-p', '--output-format', 'json', '--permission-mode', 'acceptEdits', '--max-budget-usd', '5']);
+  assert.deepEqual(argv.slice(0, 6), ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'acceptEdits']);
+  assert.ok(!argv.some((a) => /budget/i.test(a)));
   assert.ok(argv.indexOf('Bash(git push:*)') > argv.indexOf('--disallowedTools'));
   assert.ok(argv.indexOf('Bash(git commit:*)') > argv.indexOf('--disallowedTools'));
   assert.ok(argv.includes(JSON.stringify({ disableAllHooks: true })));
@@ -98,14 +115,14 @@ test('re-running the same export reuses its worktree and branch', async () => {
   assert.equal(trees.length, 2); // the user's checkout + one figma worktree
 });
 
-test('budget cut-off and crashes are never reported as done; a stale report is not reused', async () => {
+test('a run that stops with an error is never reported as done; a stale report is not reused', async () => {
   const p = makeProject();
   await runJob({ frameDir: p.frameDir, configFile: p.config, log: quiet });
-  process.env.FAKE_SUBTYPE = 'error_max_budget_usd';
+  process.env.FAKE_SUBTYPE = 'error_during_execution';
   process.env.FAKE_EXIT = '1';
   fs.writeFileSync(path.join(p.root, 'fake-claude.cjs'), FAKE.replace("if (m) fs.writeFileSync(m[1], '# report');", ''));
   const run = await runJob({ frameDir: p.frameDir, configFile: p.config, log: quiet });
-  assert.equal(run.status, 'budget-exceeded');
+  assert.equal(run.status, 'failed');
   assert.equal(run.report, null, "the previous run's report must not count for this run");
 
   assert.equal(statusFrom(null, 0), 'failed');
@@ -167,6 +184,41 @@ test('a project that is not a git repository is skipped and Claude is never star
   assert.equal(run.status, 'skipped');
   assert.match(run.reason, /not inside a git repository/);
   assert.equal(p.calls().length, 0);
+});
+
+test('progress parser: events split across chunks, non-JSON noise, errors, and the final result', () => {
+  const logs = [];
+  const pr = createProgress({ frame: 'f', roots: [['', '/w']], started: Date.now(), log: (m) => logs.push(m) });
+  const line = (o) => JSON.stringify(o) + '\n';
+  const a = line({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Write', input: { file_path: path.resolve('/w/src/features/home/HomePage.tsx') } }] } });
+  pr.feed(a.slice(0, 25));
+  pr.feed(a.slice(25) + 'warning: not json\n');
+  pr.feed(line({ type: 'user', message: { content: [{ type: 'tool_result', is_error: true, content: 'Permission denied for rm\nmore' }] } }));
+  pr.feed(JSON.stringify({ type: 'result', subtype: 'success' })); // last line without a newline
+  const result = pr.end();
+  assert.equal(result.subtype, 'success');
+  assert.ok(logs.some((l) => /writing src\/features\/home\/HomePage\.tsx/.test(l)), logs.join('\n'));
+  assert.ok(logs.some((l) => /⚠ Permission denied for rm$/.test(l)), logs.join('\n'));
+  assert.equal(logs.length, 2);
+  const label = (command) => describeTool('Bash', { command, description: 'other' });
+  // labels come from the program each command starts with, not from words anywhere in it
+  assert.equal(label('cat vite.config.ts'), 'running: other');
+  assert.equal(label('ls node_modules/vite'), 'running: other');
+  assert.equal(label('npx vite build'), 'building the project');
+  assert.equal(label('npx vite --port 5173'), 'starting the dev server');
+  assert.equal(label('cd app && PORT=5180 npm run dev -- --port 5180'), 'starting the dev server');
+  assert.equal(label('npm install'), 'installing dependencies');
+  assert.equal(label('npm run build 2>&1 | tail -5'), 'building the project');
+  assert.equal(label('node "C:\\\\Program Files\\\\figma-lens\\\\bin\\\\figma-lens.js" check --design d --url u'), 'comparing the build with Figma (figma-lens check)');
+  assert.equal(label('cat figma-lens.config.json'), 'running: other');
+  // package-manager short forms: `yarn <script>` runs the script, only bare `yarn` / `yarn install` installs
+  assert.equal(label('yarn dev'), 'starting the dev server');
+  assert.equal(label('yarn build'), 'building the project');
+  assert.equal(label('yarn'), 'installing dependencies');
+  assert.equal(label('yarn install --frozen-lockfile'), 'installing dependencies');
+  assert.equal(label('npm start'), 'starting the dev server');
+  assert.equal(label('pnpm dev --port 5180'), 'starting the dev server');
+  assert.equal(describeTool('TodoWrite', { todos: [{ status: 'completed', content: 'a' }, { status: 'in_progress', content: 'b', activeForm: 'Building the hero' }] }), 'step: Building the hero');
 });
 
 test('queue: one job at a time, in order; an export already waiting is not queued twice', async () => {

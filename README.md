@@ -128,7 +128,6 @@ Edit `figma-lens.config.json`:
     "devServer": "npm run dev -- --port {port}",
     "url": "http://localhost:{port}/",
     "instructions": "Screens live in src/pages/<name>/; reuse components from src/components.",
-    "maxBudgetUsd": 5,
     "timeoutMinutes": 60
   }
 }
@@ -140,13 +139,24 @@ Describe your architecture in `instructions` or, better, in the project's `CLAUD
 1. The bridge answers the plugin right away, then queues the frame. Frames run one at a time, and a frame that is already waiting is not queued twice.
 2. It creates a git worktree next to your project (`<project>-figma/<frame>`) on branch `figma/<frame>`, made from your **last commit**. Your checkout, your current branch and your uncommitted work are never touched.
 3. It runs `claude -p` there with the figma-lens skill, your CLAUDE.md, the component map and the compare loop (`check` until ≤ 3%).
-4. Results go to `design/<frame>/auto/`: `run.json` (status, branch, cost, changed files), `report.md` (written by Claude: what it built, final mismatch, what it guessed, what you must decide) and `claude.json` (raw output).
+4. While it works, the bridge terminal shows live progress, one line per step:
+   ```
+   ▶ auto: implementing login on figma/login (…\my-app-figma\login)
+     [login 00:04] using the figma-lens skill
+     [login 00:09] reading export/spec.md
+     [login 01:12] writing src/features/login/LoginPage.tsx
+     [login 02:40] comparing the build with Figma (figma-lens check)
+     [login 02:51] check: 4.2% different from Figma
+     [login 03:35] check: 1.9% different from Figma
+   ✔ auto: login done → review branch figma/login, report …\design\login\auto\report.md
+   ```
+5. Results go to `design/<frame>/auto/`: `run.json` (status, branch, changed files, duration), `report.md` (written by Claude: what it built, final mismatch, what it guessed, what you must decide), `claude.json` (the final result) and `claude.jsonl` (every event, for debugging).
 
-Statuses: `done` (finished and changed files), `no-changes` (finished without building, see the report), `budget-exceeded`, `failed`, `skipped` (for example, the project isn't a git repo or has no commit yet).
+Statuses: `done` (finished and changed files), `no-changes` (finished without building, see the report), `failed`, `skipped` (for example, the project isn't a git repo or has no commit yet).
 
 **Guards:**
 - It never commits, pushes, switches branches, resets or runs `rm`. These are blocked for Claude, not just discouraged. You review the branch and merge it yourself.
-- `maxBudgetUsd` caps each run and `timeoutMinutes` stops a stuck one. A run costs about $0.30 before any real work (loading context), so budgets under about $3 usually end in `no-changes`.
+- `timeoutMinutes` stops a run that gets stuck. Runs use your Claude Code account like any other session.
 - Hooks are off in auto runs (they would wait for answers nobody can give). Set `"hooks": true` to keep them.
 - Text in the design is treated as data, never as instructions.
 - This is a guard, not a sandbox: Claude runs your project's own tools (npm, flutter…) inside the worktree.
