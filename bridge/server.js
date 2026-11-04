@@ -6,7 +6,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PNG } from 'pngjs';
-import { renderMarkdown, summarizeUsage } from './render-md.js';
+import { renderSpecFiles, summarizeUsage } from './render-md.js';
+import { planSections, cropSections } from './sections.js';
 import { findMap, loadMap } from '../tools/map.js';
 
 const VERSION = '0.2.0';
@@ -45,22 +46,72 @@ class HttpError extends Error {
   }
 }
 
-function cropSections(src, sections, scale) {
-  if (!sections || !sections.length) return [];
-  const out = [];
-  sections.forEach((s, i) => {
-    const x = Math.max(0, Math.round(s.box.x * scale));
-    const y = Math.max(0, Math.round(s.box.y * scale));
-    const w = Math.min(src.width - x, Math.round(s.box.w * scale));
-    const h = Math.min(src.height - y, Math.round(s.box.h * scale));
-    if (w <= 0 || h <= 0) return;
-    const dst = new PNG({ width: w, height: h });
-    PNG.bitblt(src, dst, x, y, w, h, 0, 0);
-    const n = String(i + 1).padStart(2, '0');
-    const slug = folderSlug(s.name, 'section').replace(/[^A-Za-z0-9-]+/g, '') || 'section';
-    out.push({ file: `sections/${n}-${slug}.png`, buf: PNG.sync.write(dst), id: s.id, name: s.name, box: s.box });
-  });
-  return out;
+/**
+ * Everything derived from spec + screenshot: section crops, spec.json, spec.md (+ per-section
+ * spec files for large frames). Shared by the bridge and `figma-lens render`, which re-runs it
+ * on an existing export. With a screenshot it replaces the export's sections/ folder (it only holds
+ * generated files); without one it cannot re-crop, so it keeps the existing crops and only
+ * replaces the section spec files.
+ * Mutates meta (warnings, sectionPlan, sectionFiles). Returns the number of files written.
+ */
+export async function writeDerived(dir, { meta, spec, tokens, usage, map, screenBuf }) {
+  const generated = (w) => /^section crops/.test(w) || /^screenshot is \d+×\d+px but/.test(w) || /^no screenshot: /.test(w);
+  meta.warnings = (Array.isArray(meta.warnings) ? meta.warnings : []).filter((w) => !generated(w));
+  const plan = planSections(meta, spec);
+  const sectionsDir = path.join(dir, 'sections');
+  if (!screenBuf) {
+    // Nothing to crop from: never delete crops we cannot regenerate.
+    const kept = Array.isArray(meta.sectionFiles) ? meta.sectionFiles : [];
+    if (kept.length) meta.warnings.push('no screenshot: kept the existing section crops; they may not match the section list');
+    const old = await fs.readdir(sectionsDir).catch(() => []);
+    for (const f of old.filter((f) => f.endsWith('.md'))) await fs.rm(path.join(sectionsDir, f), { force: true });
+    meta.sectionPlan = plan;
+    meta.sectionFiles = kept;
+    return (await writeSpecs(dir, { meta, spec, tokens, usage, map })) + 1;
+  }
+  let sectionFiles = [];
+  if (plan.length) {
+    try {
+      const src = PNG.sync.read(screenBuf);
+      const scale = meta.scale || 1;
+      const ew = Math.round(meta.width * scale);
+      const eh = Math.round(meta.height * scale);
+      if (!(Math.abs(src.width - ew) <= 1 && Math.abs(src.height - eh) <= 1)) {
+        // Never emit shifted crops: a wrong reference image is worse than none.
+        meta.warnings.push(
+          `screenshot is ${src.width}×${src.height}px but the frame at ${scale}x should be ${ew}×${eh}px — ` +
+            'screenshot pixels do not map to spec coordinates; section crops skipped',
+        );
+      } else {
+        sectionFiles = cropSections(src, plan, scale);
+      }
+    } catch (e) {
+      meta.warnings.push(`section crops failed: ${e.message}`);
+      sectionFiles = [];
+    }
+  }
+  await fs.rm(sectionsDir, { recursive: true, force: true });
+  for (const s of sectionFiles) {
+    const full = insideDir(dir, s.file);
+    await fs.mkdir(path.dirname(full), { recursive: true });
+    await fs.writeFile(full, s.buf);
+  }
+  meta.sectionPlan = plan;
+  meta.sectionFiles = sectionFiles.map(({ file, id, name, box, px }) => ({ file, id, name, box, px }));
+  return sectionFiles.length + (await writeSpecs(dir, { meta, spec, tokens, usage, map }));
+}
+
+// spec.json + spec.md (+ section spec files). Returns the number of files written.
+async function writeSpecs(dir, { meta, spec, tokens, usage, map }) {
+  await fs.writeFile(path.join(dir, 'spec.json'), JSON.stringify({ meta, spec }, null, 1));
+  const mdFiles = renderSpecFiles({ meta, spec, tokens }, usage, map);
+  for (const f of mdFiles) {
+    const full = insideDir(dir, f.file);
+    if (!full) throw new Error(`unsafe spec file path: ${f.file}`);
+    await fs.mkdir(path.dirname(full), { recursive: true });
+    await fs.writeFile(full, f.text);
+  }
+  return mdFiles.length + 1;
 }
 
 async function readMarker(dir) {
@@ -148,44 +199,15 @@ export async function writeExport(outRoot, payload, { mapFile } = {}) {
   }
 
   meta.warnings = Array.isArray(meta.warnings) ? meta.warnings : [];
-  let sectionFiles = [];
-  if (screenBuf) {
-    try {
-      const src = PNG.sync.read(screenBuf);
-      const scale = meta.scale || 1;
-      const ew = Math.round(meta.width * scale);
-      const eh = Math.round(meta.height * scale);
-      if (!(Math.abs(src.width - ew) <= 1 && Math.abs(src.height - eh) <= 1)) {
-        // Never emit shifted crops: a wrong reference image is worse than none.
-        meta.warnings.push(
-          `screenshot is ${src.width}×${src.height}px but the frame at ${scale}x should be ${ew}×${eh}px — ` +
-            'screenshot pixels do not map to spec coordinates; section crops skipped',
-        );
-      } else if (meta.sections && meta.sections.length) {
-        sectionFiles = cropSections(src, meta.sections, scale);
-        for (const s of sectionFiles) {
-          const full = insideDir(dir, s.file);
-          await fs.mkdir(path.dirname(full), { recursive: true });
-          await fs.writeFile(full, s.buf);
-        }
-      }
-    } catch (e) {
-      meta.warnings.push(`section crops failed: ${e.message}`);
-      sectionFiles = [];
-    }
-  }
-  meta.sectionFiles = sectionFiles.map(({ file, id, name, box }) => ({ file, id, name, box }));
-
   const usage = summarizeUsage(spec);
   const map = mapFor(outRoot, mapFile, meta.warnings);
-  await fs.writeFile(path.join(dir, 'spec.json'), JSON.stringify({ meta, spec }, null, 1));
   await fs.writeFile(path.join(dir, 'tokens.json'), JSON.stringify({ ...(tokens || {}), usage }, null, 1));
-  await fs.writeFile(path.join(dir, 'spec.md'), renderMarkdown({ meta, spec, tokens }, usage, map));
-  const { warnings, sections, sectionFiles: _sf, ...markerMeta } = meta;
+  const derived = await writeDerived(dir, { meta, spec, tokens, usage, map, screenBuf });
+  const { warnings, sections, sectionFiles: _sf, sectionPlan: _sp, ...markerMeta } = meta;
   await fs.writeFile(path.join(dir, MARKER), JSON.stringify(markerMeta, null, 1));
   await writeIndex(outRoot);
 
-  return { dir, files: files.length + sectionFiles.length + 3 };
+  return { dir, files: files.length + derived + 1 };
 }
 
 function readBody(req) {

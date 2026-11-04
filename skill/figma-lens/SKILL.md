@@ -11,11 +11,12 @@ figma-lens is a Figma plugin plus a local bridge. The user selects frames in Fig
 design/
   INDEX.md                  ← list of all exported frames (start here)
   <frame>/
-    spec.md                 ← READ FIRST: compact layer tree with exact values
+    spec.md                 ← READ FIRST: compact layer tree with exact values (an overview for large frames)
     spec.json               ← full data (+ per-layer CSS from Figma) when spec.md is not enough
     tokens.json             ← variables (all modes), styles, usage counts of raw values
     screen@2x.png           ← full render (2x by default)
-    sections/NN-name.png    ← crops of the top-level blocks at full resolution
+    sections/NN-name.png    ← crops of the page's blocks (long edge ≤ 1568 px; very tall ones in parts -1, -2…)
+    sections/NN-name.md     ← large frames only: that section's layer tree
     assets/*.svg            ← icons/vector art, ready to use
     images/*                ← original bitmaps used as image fills
     compare/                ← written by `figma-lens check` (report.md, side-by-side.png, diff.png)
@@ -35,14 +36,24 @@ Never guess a design from a description when an export is possible. Ask for the 
 
 ## Workflow
 
-1. **Read `spec.md` fully** (it is small). Note the frame size, the layout tree, the variables and styles, and the assets.
-2. **Look at the images.** Read `sections/*.png` one by one for detail. Use `screen@2x.png` only for the overall picture, because large images are downscaled when you view them. Values always come from the spec, never from measuring pixels.
+1. **Read `spec.md` fully.** Note the frame size, the layout tree, the variables and styles, and the assets. If it starts with **"Large frame: the layer tree is split per section"**, follow "Large frames" below instead of reading every section file up front.
+2. **Look at the images.** Read `sections/*.png` one by one for detail. Don't open `screen@2x.png` for a tall page (it gets downscaled to mush and weighs down every later request); for a normal screen use it only for the overall picture. Values always come from the spec, never from measuring pixels.
 3. **Use the component map** (see "Component map" below). Every `⇒ USE …` in spec.md is mandatory: use that widget/component and its prop mapping, and use mapped tokens (`(color/primary ⇒ AppColors.primary)`) instead of raw values. For items marked `(not in map)`, search the codebase for the existing theme and widgets (Flutter `ThemeData`, `AppColors`, `TextTheme`, spacing constants, `lib/widgets`; web CSS variables, Tailwind config, `src/components`). Use raw values only when no token exists, and tell the user which ones you added.
 4. **Reuse components.** A layer marked `component Button {Type=Primary}` should use the project's existing Button widget or component with matching props. Build a new one only if none exists, make it reusable, and add it to the map.
 5. **Build top-down, following the tree.** Auto layout maps to Row/Column/flex (tables below). Only `@x,y` layers (no auto layout, or `absolute`) need Stack/Positioned or absolute positioning.
 6. **Use the exported files.** Put `assets/*.svg` and `images/*` into the project's asset folder and reference them. Never redraw icons and never substitute a different icon set.
 7. **Copy text exactly** from `"…"` in spec.md, including case, punctuation and Arabic/RTL strings. Text with several `run` lines needs rich text (TextSpan / nested spans).
 8. **Verify with the compare-and-fix loop** (below). Don't declare a screen done from reading code; prove it with a screenshot diff.
+
+## Large frames (long landing pages, HTML imports)
+
+Every image you open stays in the conversation and is re-sent with every later request. A few full-width crops of a tall page can make the session slow or fail outright. So:
+
+- **One section at a time.** Read `sections/NN-name.md`, look at its crop(s), build that section, then move to the next. Don't load all crops first.
+- **One image per turn**, and only the crop you are working on. If you need your own crop (e.g. a detail), make it ≤ 800 px wide.
+- **Write the page in parts** (one edit per section) instead of one huge file write.
+- **Export from older figma-lens?** If `sections/` holds a single crop of the whole page or spec.md is over ~40 KB, run `figma-lens render design/<frame>` first: it re-crops the sections and splits the spec.
+- In the compare loop, look at `side-by-side.png` only when the report's regions aren't enough, since it is as tall as the page.
 
 ## Compare-and-fix loop
 
@@ -54,7 +65,9 @@ After building a screen, compare the real result against Figma and fix what diff
    - Flutter Android: run the app on an emulator/device and navigate to the screen.
 2. **Check it:**
    - Web / Flutter web: `figma-lens check --design design/<frame> --url http://localhost:<port>/<route>`
-     (the viewport is set to the frame's size and scale automatically).
+     (the viewport is set to the frame's width and scale automatically, and the whole page is captured, so a
+     build taller than the frame shows up as "N units taller"). For an app screen that scrolls on purpose and
+     whose frame shows one screenful, add `--viewport`.
    - Android: `figma-lens check --design design/<frame> --adb --crop-top <status bar px> [--crop-bottom <nav bar px>]`
      (status bar ≈ 24–48 dp × device density; crop it so only the app content is compared).
 3. **Read `design/<frame>/compare/report.md`** (mismatch %, the biggest differing areas and the Figma layer ids in each) and **look at `compare/side-by-side.png`** (Figma | build | diff, red = different).

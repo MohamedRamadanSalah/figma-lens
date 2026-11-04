@@ -16,7 +16,8 @@ design/<frame>/
   spec.json          full data, including Figma's generated CSS per layer
   tokens.json        variables (every mode), styles, and usage counts of raw values
   screen@2x.png      full render
-  sections/*.png     top-level blocks cropped at full resolution
+  sections/*.png     the page's blocks, cropped (long edge ≤ 1568 px; one huge block is split into its children)
+  sections/*.md      large frames only: one layer tree per section, so the agent reads one at a time
   assets/*.svg       icons and vector art
   images/*           original bitmaps
   compare/           report.md, side-by-side.png, diff.png (written by `figma-lens check`)
@@ -74,7 +75,7 @@ images: design/home/compare/side-by-side.png
 
 After the fix, the next run prints `Home: 0% different (was 19.4%)`.
 
-- The viewport is set to the frame's size and scale automatically, and screenshots at any density are resized onto the design's pixel grid.
+- The viewport is set to the frame's width and scale automatically, and the whole page is captured, so a build that is taller than the frame is reported instead of cut off (`--viewport` captures only one frame-sized screen). Screenshots at any density are resized onto the design's pixel grid.
 - `report.md` lists the biggest differing areas with the **Figma layer ids** in them, per-section scores, and whether the build is taller or shorter than the frame.
 - Each run records its score in `compare/history.json`, so the agent can see progress.
 - `--fail-above 3` exits with code 1 when the mismatch is above 3%, for CI.
@@ -115,7 +116,7 @@ This writes `demo/demo.gif` (first build → fixed build) and `demo/before-after
 | `figma-lens shot --design <dir> --url <url>` / `--adb --out shot.png` | Screenshot only |
 | `figma-lens compare --design <dir> --actual <png>` | Compare an existing screenshot |
 | `figma-lens map [--design design] [--map file]` | Create/extend the component map |
-| `figma-lens render <dir> [--map file]` | Regenerate spec.md (after editing the map) |
+| `figma-lens render <dir> [--map file]` | Regenerate spec.md, section crops and section specs (after editing the map or updating figma-lens) |
 | `figma-lens demo --design <dir> --before <png> --after <png>` | GIF + before/after image |
 
 Common flags: `--crop-top/--crop-bottom <px>` (phone status/nav bars), `--fail-above <pct>`, `--full` (full-page web screenshot), `--wait <ms>`, `--channel msedge|chrome`, `--serial <adb device>`, `--json`.
@@ -126,7 +127,7 @@ Common flags: `--crop-top/--crop-bottom <px>` (phone status/nav bars), `--fail-a
 |---|---|
 | Screenshot scale | 1x / 2x / 3x PNG render (default 2x) |
 | Include CSS per layer | adds Figma's CSS to `spec.json` (first 800 layers) |
-| Section crops | the bridge crops top-level blocks out of the screenshot |
+| Section crops | the bridge crops the page's blocks out of the screenshot (and splits spec.md per section for large frames) |
 
 | Bridge flag / env | Default |
 |---|---|

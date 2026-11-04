@@ -2,8 +2,8 @@
 // figma-lens CLI: bridge, screenshot, compare-and-fix, component map, demo.
 import fs from 'node:fs';
 import path from 'node:path';
-import { startBridge } from '../bridge/server.js';
-import { renderMarkdown, summarizeUsage } from '../bridge/render-md.js';
+import { startBridge, writeDerived } from '../bridge/server.js';
+import { summarizeUsage } from '../bridge/render-md.js';
 import { compare } from '../tools/compare.js';
 import { shotWeb, shotAdb } from '../tools/shot.js';
 import { initMap, loadMap, findMap, MAP_FILE } from '../tools/map.js';
@@ -15,8 +15,11 @@ Usage:
   figma-lens bridge  [--out design] [--port 4141] [--map figma-lens.map.json]
       Receive exports from the Figma plugin.
 
-  figma-lens check   --design design/<frame> (--url <page url> | --adb) [--crop-top px] [--crop-bottom px] [--fail-above pct]
+  figma-lens check   --design design/<frame> (--url <page url> | --adb) [--viewport] [--crop-top px] [--crop-bottom px] [--fail-above pct]
       Screenshot the build and compare it with the Figma frame (shot + compare in one step).
+      Web pages are captured full-page, so a build taller than the frame is reported instead of
+      cut off. --viewport captures only the frame-sized viewport (e.g. a scrolling app screen
+      whose frame shows one screenful); full-page capture also resizes 100vh / position:fixed.
 
   figma-lens shot    --design design/<frame> --url <page url> [--out shot.png] [--full] [--wait ms] [--channel msedge|chrome]
   figma-lens shot    --adb [--serial id] --out shot.png
@@ -29,7 +32,9 @@ Usage:
       Create/extend the component map with every component and token seen in the exports.
 
   figma-lens render  design/<frame> [--map figma-lens.map.json]
-      Re-generate spec.md (e.g. after editing the component map).
+      Re-generate spec.md, the section crops and (for large frames) the per-section spec files,
+      e.g. after editing the component map or updating figma-lens. Rewrites spec.json/spec.md and
+      replaces <frame>/sections/ (without the screenshot it keeps the existing crops).
 
   figma-lens demo    --design design/<frame> --before first.png --after fixed.png [--out dir] [--crop-top px]
       Make demo.gif + before-after.png (Figma | build | diff) for a README.
@@ -38,7 +43,7 @@ Usage:
 function parse(argv) {
   const flags = {};
   const pos = [];
-  const bool = new Set(['full', 'adb', 'json', 'help']);
+  const bool = new Set(['full', 'viewport', 'adb', 'json', 'help']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith('--')) {
@@ -73,7 +78,7 @@ function mapNear(designDir, explicit) {
   return loadMap(findMap([path.dirname(designDir), path.dirname(path.dirname(designDir))]));
 }
 
-async function takeShot(flags, designDir, out) {
+async function takeShot(flags, designDir, out, { fullPage = !!flags.full } = {}) {
   if (flags.adb) return shotAdb({ out, serial: flags.serial });
   const meta = designDir ? readMeta(designDir) : {};
   return shotWeb({
@@ -82,7 +87,7 @@ async function takeShot(flags, designDir, out) {
     height: num(flags.height, meta.height || 844),
     scale: num(flags.scale, meta.scale || 2),
     out,
-    fullPage: !!flags.full,
+    fullPage,
     waitMs: num(flags.wait, 800),
     channel: flags.channel,
   });
@@ -145,7 +150,9 @@ async function main() {
       const outDir = path.resolve(flags.out || path.join(designDir, 'compare'));
       fs.mkdirSync(outDir, { recursive: true });
       const shot = path.join(outDir, 'actual.png');
-      await takeShot(flags, designDir, shot);
+      // Full page by default: with a frame-sized viewport, anything below the frame height is cut
+      // off, so a build that is too tall never shows up as a height difference.
+      await takeShot(flags, designDir, shot, { fullPage: !flags.viewport });
       const r = compare({
         designDir,
         actualFile: shot,
@@ -175,8 +182,11 @@ async function main() {
       const tokensAll = JSON.parse(fs.readFileSync(path.join(designDir, 'tokens.json'), 'utf8'));
       const { usage, ...tokens } = tokensAll;
       const map = mapNear(designDir, flags.map);
-      fs.writeFileSync(path.join(designDir, 'spec.md'), renderMarkdown({ meta, spec, tokens }, usage || summarizeUsage(spec), map));
-      console.log(`rewrote ${path.join(designDir, 'spec.md')}${map ? ` using ${map.file}` : ' (no component map found)'}`);
+      const screenFile = meta.screen && path.join(designDir, meta.screen);
+      const screenBuf = screenFile && fs.existsSync(screenFile) ? fs.readFileSync(screenFile) : null;
+      await writeDerived(designDir, { meta, spec, tokens, usage: usage || summarizeUsage(spec), map, screenBuf });
+      const parts = meta.sectionPlan.length ? `, ${meta.sectionFiles.length} section crop(s)` : '';
+      console.log(`rewrote ${path.join(designDir, 'spec.md')}${parts}${map ? ` using ${map.file}` : ' (no component map found)'}`);
       return;
     }
 

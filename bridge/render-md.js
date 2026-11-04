@@ -176,14 +176,28 @@ function nodeLine(n, parent) {
   return parts.join(' · ');
 }
 
-function treeLines(n, parent, depth, out) {
+// cut: Map(node id → section stem). Those subtrees are written to their own file instead.
+function treeLines(n, parent, depth, out, cut = null) {
   const pad = '  '.repeat(depth);
   out.push(`${pad}- ${nodeLine(n, parent)}`);
+  if (cut && depth > 0 && cut.has(n.id)) {
+    out.push(`${pad}  - … ${countNodes(n) - 1} layers inside: see \`${cut.get(n.id)}.md\``);
+    return;
+  }
   if (n.text && n.text.segments) {
     for (const s of n.text.segments) out.push(`${pad}    - run ${quote(s.text)}: ${textStyleStr(s)}`);
   }
-  for (const c of n.children || []) treeLines(c, n, depth + 1, out);
+  for (const c of n.children || []) treeLines(c, n, depth + 1, out, cut);
 }
+
+function countNodes(n) {
+  let c = 0;
+  eachNode(n, () => c++);
+  return c;
+}
+
+// Trees longer than this get one spec file per section, so the agent can read one section at a time.
+export const SPLIT_LINES = 400;
 
 function usageLines(title, list, limit = 25) {
   if (!list.length) return [];
@@ -237,7 +251,58 @@ export function renderMarkdown(payload, usage, map = null) {
   }
 }
 
-function renderMarkdownInner(payload, usage, map) {
+/**
+ * All spec markdown files for an export: [{file, text}]. Normally just spec.md; for large trees
+ * (more than SPLIT_LINES lines) with a section plan, spec.md becomes an overview whose tree stops at
+ * each section, and every section gets `<stem>.md` next to its crop(s).
+ */
+export function renderSpecFiles(payload, usage, map = null) {
+  const { meta, spec } = payload;
+  const plan = (meta.sectionPlan || []).filter((s) => s.stem);
+  const full = [];
+  treeLines(spec, null, 0, full);
+  if (full.length <= SPLIT_LINES || plan.length < 2) return [{ file: 'spec.md', text: renderMarkdown(payload, usage, map) }];
+
+  const parents = new Map();
+  const nodes = new Map();
+  eachNode(spec, (n, p) => {
+    nodes.set(n.id, n);
+    parents.set(n.id, p);
+  });
+  const sections = plan.filter((s) => nodes.has(s.id) && s.id !== spec.id);
+  if (sections.length < 2) return [{ file: 'spec.md', text: renderMarkdown(payload, usage, map) }];
+  const cut = new Map(sections.map((s) => [s.id, s.stem]));
+
+  MAP = map;
+  try {
+    const files = [{ file: 'spec.md', text: renderMarkdownInner(payload, usage, map, cut) }];
+    for (const s of sections) {
+      const n = nodes.get(s.id);
+      const crops = (meta.sectionFiles || []).filter((f) => f.id === s.id).map((f) => `\`${f.file}\``);
+      const out = [
+        `# ${meta.nodeName} › ${s.name}`,
+        '',
+        `Section \`${s.id}\` at ${num(s.box.x)},${num(s.box.y)} ${num(s.box.w)}×${num(s.box.h)} in the frame. Part of \`spec.md\` (read its "How to read this", variables and assets first).`,
+        crops.length ? `Crop: ${crops.join(', ')}.` : 'No crop for this section (see the warnings in spec.md).',
+        '',
+        '## Layer tree',
+      ];
+      treeLines(n, parents.get(s.id), 0, out);
+      out.push('');
+      files.push({ file: `${s.stem}.md`, text: out.join('\n') });
+    }
+    return files;
+  } finally {
+    MAP = null;
+  }
+}
+
+function cropLine(s, meta) {
+  const px = s.px && s.px !== meta.scale ? ` (${s.px}px per unit)` : '';
+  return `\`${s.file}\` — ${quote(s.name)} at ${num(s.box.x)},${num(s.box.y)} ${num(s.box.w)}×${num(s.box.h)}${px}`;
+}
+
+function renderMarkdownInner(payload, usage, map, cut = null) {
   const { meta, spec, tokens = {} } = payload;
   const out = [];
   out.push(`# ${meta.nodeName}`);
@@ -245,9 +310,16 @@ function renderMarkdownInner(payload, usage, map) {
   out.push(`Figma file **${meta.file}** · page **${meta.page}** · node \`${meta.nodeId}\` (${meta.nodeType}) · ${num(meta.width)}×${num(meta.height)} · exported ${meta.exportedAt} by figma-lens ${meta.version}`);
   out.push('');
   out.push(`Screenshot: \`${meta.screen}\` (scale ${meta.scale}x — divide pixel sizes by ${meta.scale} to get design units).`);
-  if (meta.sectionFiles && meta.sectionFiles.length) {
-    out.push('Section crops (same scale, read these for detail):');
-    for (const s of meta.sectionFiles) out.push(`- \`${s.file}\` — ${quote(s.name)} at ${num(s.box.x)},${num(s.box.y)} ${num(s.box.w)}×${num(s.box.h)}`);
+  if (cut) {
+    out.push('');
+    out.push(`**Large frame: the layer tree is split per section.** Read this file once (no full tree here), then work one section at a time: read its \`.md\`, look at its crop(s), build it, then move on.`);
+    for (const s of meta.sectionPlan.filter((p) => cut.has(p.id))) {
+      const crops = (meta.sectionFiles || []).filter((f) => f.id === s.id).map((f) => f.file.replace(/^sections\//, ''));
+      out.push(`- \`${s.stem}.md\` — ${quote(s.name)} at ${num(s.box.x)},${num(s.box.y)} ${num(s.box.w)}×${num(s.box.h)}${crops.length ? ` · crop ${crops.join(', ')}` : ''}`);
+    }
+  } else if (meta.sectionFiles && meta.sectionFiles.length) {
+    out.push('Section crops (read these for detail):');
+    for (const s of meta.sectionFiles) out.push(`- ${cropLine(s, meta)}`);
   }
   out.push('');
   out.push('## How to read this');
@@ -315,9 +387,9 @@ function renderMarkdownInner(payload, usage, map) {
     out.push('');
   }
 
-  out.push('## Layer tree');
+  out.push(cut ? '## Layer tree (overview; each section continues in its own file)' : '## Layer tree');
   const lines = [];
-  treeLines(spec, null, 0, lines);
+  treeLines(spec, null, 0, lines, cut);
   out.push(...lines);
   out.push('');
   return out.join('\n');
