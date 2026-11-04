@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { runJob, createQueue, statusFrom, createProgress, describeTool, explainFailure, buildPrompt } from '../tools/auto.js';
+import { runJob, createQueue, statusFrom, createProgress, describeTool, explainFailure, buildPrompt, loadAutoConfig } from '../tools/auto.js';
 import { createBridge, autoHandler } from '../bridge/server.js';
 
 // A stand-in for Claude Code: records what it was given, "builds" a file in its cwd,
@@ -40,7 +40,8 @@ const git = (args, cwd) => {
 };
 
 // <root>/proj (git repo, 1 commit) with design/<frame>/spec.json and figma-lens.config.json.
-function makeProject({ withGit = true, enabled = true, frame = 'home' } = {}) {
+// auto: extra config (tests never wait for real retry delays: retryDelaySeconds 0 unless given)
+function makeProject({ withGit = true, enabled = true, frame = 'home', auto = {} } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'figma-lens-auto-'));
   const proj = path.join(root, 'proj');
   fs.mkdirSync(proj);
@@ -52,7 +53,7 @@ function makeProject({ withGit = true, enabled = true, frame = 'home' } = {}) {
   }
   const fake = path.join(root, 'fake-claude.cjs');
   fs.writeFileSync(fake, FAKE);
-  fs.writeFileSync(path.join(proj, 'figma-lens.config.json'), JSON.stringify({ auto: { enabled, claude: [process.execPath, fake] } }));
+  fs.writeFileSync(path.join(proj, 'figma-lens.config.json'), JSON.stringify({ auto: { enabled, claude: [process.execPath, fake], retryDelaySeconds: 0, ...auto } }));
   fs.writeFileSync(path.join(proj, 'figma-lens.map.json'), '{"components":{},"tokens":{}}'); // untracked, like a real map
   const frameDir = path.join(proj, 'design', frame);
   fs.mkdirSync(frameDir, { recursive: true });
@@ -272,6 +273,68 @@ let prompt = ''; process.stdin.on('data', (c) => (prompt += c)); process.stdin.o
   fs.writeFileSync(path.join(p.root, 'fake-claude.cjs'), FAKE);
   await runJob({ frameDir: p.frameDir, configFile: p.config, log: quiet });
   assert.match(p.calls().at(-1).prompt, /previous run on this branch stopped before finishing/);
+});
+
+// A fake Claude that fails with `failText` on the first N calls, then succeeds (counts calls in a file).
+const flaky = (counterFile, failures, failText) => `
+const fs = require('fs');
+let prompt = ''; process.stdin.on('data', (c) => (prompt += c)); process.stdin.on('end', () => {
+  const n = (fs.existsSync(${JSON.stringify(counterFile)}) ? Number(fs.readFileSync(${JSON.stringify(counterFile)}, 'utf8')) : 0) + 1;
+  fs.writeFileSync(${JSON.stringify(counterFile)}, String(n));
+  fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({ prompt }) + '\\n');
+  fs.writeFileSync('part-' + n + '.txt', 'x');
+  const out = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+  if (n <= ${failures}) { out({ type: 'result', subtype: 'success', is_error: true, result: ${JSON.stringify(failText)} }); process.exit(1); }
+  out({ type: 'result', subtype: 'success', is_error: false, num_turns: 3, result: 'ok' });
+});`;
+
+test('a temporary problem is retried automatically and continues from the partial work', async () => {
+  const p = makeProject();
+  fs.writeFileSync(path.join(p.root, 'fake-claude.cjs'), flaky(path.join(p.root, 'count.txt'), 1, 'Request timed out'));
+  const logs = [];
+  const run = await runJob({ frameDir: p.frameDir, configFile: p.config, log: (m) => logs.push(m) });
+  assert.equal(run.status, 'done', JSON.stringify(run));
+  assert.equal(run.attempts, 2);
+  assert.ok(logs.some((l) => /↻ auto: home hit a temporary problem \(Request timed out\); retrying in 0 s/.test(l)), logs.join('\n'));
+  const prompts = p.calls().map((x) => x.prompt);
+  assert.doesNotMatch(prompts[0], /stopped before finishing/);
+  assert.match(prompts[1], /stopped before finishing/); // the retry continues the partial work
+});
+
+test('problems a retry cannot fix (usage limit) are not retried; retries stop after the configured count', async () => {
+  const p = makeProject();
+  fs.writeFileSync(path.join(p.root, 'fake-claude.cjs'), flaky(path.join(p.root, 'count.txt'), 9, 'Claude AI usage limit reached'));
+  const run = await runJob({ frameDir: p.frameDir, configFile: p.config, log: quiet });
+  assert.equal(run.attempts, 1);
+  assert.match(run.problem, /usage limit/);
+
+  const q = makeProject({ auto: { retries: 1 } });
+  fs.writeFileSync(path.join(q.root, 'fake-claude.cjs'), flaky(path.join(q.root, 'count.txt'), 9, 'Request timed out'));
+  const run2 = await runJob({ frameDir: q.frameDir, configFile: q.config, log: quiet });
+  assert.equal(run2.status, 'failed');
+  assert.equal(run2.attempts, 2);
+  assert.match(run2.problem, /tried 2 times/);
+});
+
+test('a frozen run (no output at all) is stopped by idleMinutes, not left hanging for the full time limit', async () => {
+  const p = makeProject({ auto: { idleMinutes: 0.02, retries: 0 } }); // 1.2 s
+  fs.writeFileSync(path.join(p.root, 'fake-claude.cjs'), "process.stdin.resume(); setInterval(() => {}, 1000);");
+  const t = Date.now();
+  const run = await runJob({ frameDir: p.frameDir, configFile: p.config, log: quiet });
+  assert.ok(Date.now() - t < 15000, 'stopped quickly');
+  assert.equal(run.status, 'failed');
+  assert.match(run.reason, /no activity for 0\.02 minutes/);
+  assert.match(run.problem, /stopped responding/);
+});
+
+test('auto settings are validated; defaults allow long runs', () => {
+  const p = makeProject({ auto: { retries: 9 } });
+  assert.throws(() => loadAutoConfig(p.config), /retries must be a whole number from 0 to 5/);
+  const q = makeProject();
+  const cfg = loadAutoConfig(q.config);
+  assert.equal(cfg.timeoutMinutes, 300);
+  assert.equal(cfg.idleMinutes, 20);
+  assert.equal(cfg.retries, 2);
 });
 
 test('failure explanations for the common causes', () => {

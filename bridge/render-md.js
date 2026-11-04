@@ -309,7 +309,7 @@ function renderMarkdownInner(payload, usage, map, cut = null) {
   out.push('');
   out.push(`Figma file **${meta.file}** · page **${meta.page}** · node \`${meta.nodeId}\` (${meta.nodeType}) · ${num(meta.width)}×${num(meta.height)} · exported ${meta.exportedAt} by figma-lens ${meta.version}`);
   out.push('');
-  out.push(`Screenshot: \`${meta.screen}\` (scale ${meta.scale}x — divide pixel sizes by ${meta.scale} to get design units).`);
+  out.push(`Frame preview: \`${meta.screen}\` (scale ${meta.scale}x — divide pixel sizes by ${meta.scale} to get design units).`);
   if (cut) {
     out.push('');
     out.push(`**Large frame: the layer tree is split per section.** Read this file once (no full tree here), then work one section at a time: read its \`.md\`, look at its crop(s), build it, then move on.`);
@@ -323,7 +323,7 @@ function renderMarkdownInner(payload, usage, map, cut = null) {
   }
   out.push('');
   out.push('## How to read this');
-  out.push('- Units are design px = CSS px = Flutter logical px. Never scale them by the screenshot factor.');
+  out.push('- Units are design px = CSS px = Flutter logical px. Never scale them by the preview scale.');
   out.push('- `@x,y` = position inside the parent; shown only where the parent has no auto layout (or the child is absolute).');
   out.push('- Auto layout: `row|column gap N pad t,r,b,l main:… cross:…`. `w:/h:` sizing is FIXED, HUG (fit content) or FILL (fill parent).');
   out.push('- Paints are listed bottom → top. Colors are `#RRGGBB` or `#RRGGBBAA`. Names in parentheses are Figma variables; `[style …]` are Figma styles — prefer the matching token in code over the raw value.');

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// figma-lens CLI: bridge, screenshot, compare-and-fix, component map, demo.
+// figma-lens CLI: bridge, render, compare-and-fix, component map, demo.
 import fs from 'node:fs';
 import path from 'node:path';
 import { startBridge, writeDerived } from '../bridge/server.js';
@@ -9,6 +9,8 @@ import { shotWeb, shotAdb } from '../tools/shot.js';
 import { initMap, loadMap, findMap, MAP_FILE } from '../tools/map.js';
 import { makeDemo } from '../tools/demo.js';
 import { findConfig, prepareJob, runJob, CONFIG_FILE, CONFIG_TEMPLATE } from '../tools/auto.js';
+import { nameAssets } from '../bridge/asset-names.js';
+import { c, pct } from '../tools/colors.js';
 
 const HELP = `figma-lens — let coding agents see Figma designs accurately
 
@@ -24,17 +26,17 @@ Usage:
       Run (or with --dry-run: only print) the Claude Code job for one export, e.g. to retry it.
 
   figma-lens check   --design design/<frame> (--url <page url> | --adb) [--viewport] [--crop-top px] [--crop-bottom px] [--fail-above pct]
-      Screenshot the build and compare it with the Figma frame (shot + compare in one step).
+      Render your build and compare it with the Figma frame (shot + compare in one step).
       Web pages are captured full-page, so a build taller than the frame is reported instead of
       cut off. --viewport captures only the frame-sized viewport (e.g. a scrolling app screen
       whose frame shows one screenful); full-page capture also resizes 100vh / position:fixed.
 
   figma-lens shot    --design design/<frame> --url <page url> [--out shot.png] [--full] [--wait ms] [--channel msedge|chrome]
   figma-lens shot    --adb [--serial id] --out shot.png
-      Screenshot a web page (or Flutter web) at the frame's size, or an Android device/emulator.
+      Render a web page (or Flutter web) at the frame's size, or an Android device/emulator, as an image.
 
   figma-lens compare --design design/<frame> --actual shot.png [--crop-top px] [--crop-bottom px] [--out dir] [--fail-above pct]
-      Diff a screenshot against the frame. Writes compare/{report.md,report.json,diff.png,side-by-side.png}.
+      Diff an image of your build against the frame. Writes compare/{report.md,report.json,diff.png,side-by-side.png}.
 
   figma-lens map     [--design design] [--map figma-lens.map.json]
       Create/extend the component map with every component and token seen in the exports.
@@ -42,7 +44,7 @@ Usage:
   figma-lens render  design/<frame> [--map figma-lens.map.json]
       Re-generate spec.md, the section crops and (for large frames) the per-section spec files,
       e.g. after editing the component map or updating figma-lens. Rewrites spec.json/spec.md and
-      replaces <frame>/sections/ (without the screenshot it keeps the existing crops).
+      replaces <frame>/sections/ (without the frame preview it keeps the existing crops); gives meaningless icon/image names real ones.
 
   figma-lens demo    --design design/<frame> --before first.png --after fixed.png [--out dir] [--crop-top px]
       Make demo.gif + before-after.png (Figma | build | diff) for a README.
@@ -105,15 +107,15 @@ function printCompare(r, flags) {
   if (flags.json) {
     console.log(JSON.stringify(r, null, 1));
   } else {
-    const trend = r.previousMismatchPct != null ? ` (was ${r.previousMismatchPct}%)` : '';
-    console.log(`${r.frame}: ${r.mismatchPct}% different${trend}`);
-    if (Math.abs(r.heightDelta) >= 2) console.log(`  build is ${Math.abs(r.heightDelta)} units ${r.heightDelta > 0 ? 'taller' : 'shorter'} than the frame`);
+    const trend = r.previousMismatchPct != null ? c.gray(` (was ${r.previousMismatchPct}%)`) : '';
+    console.log(`${c.bold(r.frame)}: ${pct(r.mismatchPct)} different from the Figma frame${trend}`);
+    if (Math.abs(r.heightDelta) >= 2) console.log(c.yellow(`  ⚠ your build is ${Math.abs(r.heightDelta)} units ${r.heightDelta > 0 ? 'taller' : 'shorter'} than the frame`));
     for (const g of r.regions.slice(0, 5)) {
       const layers = g.nodes.map((n) => `${n.id} "${n.name}"`).join(', ') || 'background/spacing';
-      console.log(`  - ${g.box.x},${g.box.y} ${g.box.w}×${g.box.h}: ${g.mismatchPct}% → ${layers}`);
+      console.log(`  ${c.gray('-')} ${g.box.x},${g.box.y} ${g.box.w}×${g.box.h}: ${pct(g.mismatchPct)} → ${c.gray(layers)}`);
     }
-    console.log(`report: ${r.reportFile}`);
-    console.log(`images: ${r.files.sideBySide}`);
+    console.log(`${c.gray('report:')} ${r.reportFile}`);
+    console.log(`${c.gray('Figma | build | diff:')} ${r.files.sideBySide}`);
   }
   if (flags['fail-above'] !== undefined && r.mismatchPct > Number(flags['fail-above'])) process.exitCode = 1;
 }
@@ -140,7 +142,7 @@ async function main() {
         // Claude Code reads project rules from ./CLAUDE.md or ./.claude/CLAUDE.md
         if (!['CLAUDE.md', path.join('.claude', 'CLAUDE.md')].some((f) => fs.existsSync(path.resolve(f)))) {
           console.log('');
-          console.log('⚠ No CLAUDE.md here. Auto runs follow ONLY what your project writes down: add a CLAUDE.md with your');
+          console.log(c.yellow('⚠ No CLAUDE.md here.') + ' Auto runs follow ONLY what your project writes down: add a CLAUDE.md with your');
           console.log('  architecture (where pages, components, icons, images and tokens go) and commit it before exporting.');
           console.log('  Guide + templates: https://github.com/MohamedRamadanSalah/figma-lens/blob/main/docs/PROJECT-SETUP.md');
         }
@@ -171,13 +173,13 @@ async function main() {
       const designDir = flags.adb ? null : needDesign(flags);
       const out = path.resolve(flags.out || 'shot.png');
       await takeShot(flags, designDir, out);
-      console.log(`screenshot: ${out}`);
+      console.log(`${c.green('✔')} saved: ${out}`);
       return;
     }
 
     case 'compare': {
       const designDir = needDesign(flags);
-      if (!flags.actual) throw new Error('--actual <screenshot.png> is required');
+      if (!flags.actual) throw new Error('--actual <build.png> is required (an image of your build)');
       const r = compare({
         designDir,
         actualFile: path.resolve(flags.actual),
@@ -228,15 +230,28 @@ async function main() {
       const map = mapNear(designDir, flags.map);
       const screenFile = meta.screen && path.join(designDir, meta.screen);
       const screenBuf = screenFile && fs.existsSync(screenFile) ? fs.readFileSync(screenFile) : null;
+      // Older exports: give meaningless icon/image file names (container-12.svg, hashes) real names.
+      const onDisk = ['assets', 'images'].flatMap((d) =>
+        fs.existsSync(path.join(designDir, d)) ? fs.readdirSync(path.join(designDir, d)).map((f) => ({ path: `${d}/${f}` })) : [],
+      );
+      const { renames } = nameAssets(spec, onDisk);
+      // Check every rename before doing any, so a problem can never leave the folder half renamed.
+      for (const [from, to] of Object.entries(renames)) {
+        if (!fs.existsSync(path.join(designDir, from))) throw new Error(`cannot rename ${from}: file not found (nothing was changed)`);
+        if (fs.existsSync(path.join(designDir, to))) throw new Error(`cannot rename ${from} to ${to}: target exists (nothing was changed)`);
+      }
+      for (const [from, to] of Object.entries(renames)) fs.renameSync(path.join(designDir, from), path.join(designDir, to));
+      if (Object.keys(renames).length) meta.assetRenames = { ...(meta.assetRenames || {}), ...renames };
       await writeDerived(designDir, { meta, spec, tokens, usage: usage || summarizeUsage(spec), map, screenBuf });
       const parts = meta.sectionPlan.length ? `, ${meta.sectionFiles.length} section crop(s)` : '';
-      console.log(`rewrote ${path.join(designDir, 'spec.md')}${parts}${map ? ` using ${map.file}` : ' (no component map found)'}`);
+      const named = Object.keys(renames).length ? `, ${Object.keys(renames).length} asset(s) renamed` : '';
+      console.log(`${c.green('✔')} rewrote ${path.join(designDir, 'spec.md')}${parts}${named}${map ? ` using ${map.file}` : c.gray(' (no component map found)')}`);
       return;
     }
 
     case 'demo': {
       const designDir = needDesign(flags);
-      if (!flags.before || !flags.after) throw new Error('--before and --after screenshots are required');
+      if (!flags.before || !flags.after) throw new Error('--before and --after images are required');
       const r = makeDemo({
         designDir,
         before: path.resolve(flags.before),

@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { c, pct } from './colors.js';
 
 export const CONFIG_FILE = 'figma-lens.config.json';
 const REPO = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -31,7 +32,15 @@ const DEFAULTS = {
   devServer: '',
   url: '',
   instructions: '',
-  timeoutMinutes: 60,
+  // Hard cap for one export, including retries. Generous: a run that keeps working is never cut short…
+  timeoutMinutes: 300,
+  // …because a FROZEN run is caught by this instead: no output at all for this long = stuck.
+  idleMinutes: 20,
+  // Temporary problems (API timeout, busy service, network, frozen run) are retried automatically,
+  // continuing from the partial work, after retryDelaySeconds, then 3× longer each time.
+  retries: 2,
+  retryDelaySeconds: 60,
+  model: '', // optional: a Claude model name or alias for auto runs (e.g. a faster one)
   worktreeRoot: '',
   allowedTools: null,
   hooks: false,
@@ -44,7 +53,9 @@ export const CONFIG_TEMPLATE = {
     devServer: 'npm run dev -- --port {port}',
     url: 'http://localhost:{port}/',
     instructions: 'Screens live in src/pages/<name>/; reuse components from src/components. (Describe your architecture here or in CLAUDE.md.)',
-    timeoutMinutes: 60,
+    timeoutMinutes: 300,
+    idleMinutes: 20,
+    retries: 2,
   },
 };
 
@@ -68,6 +79,9 @@ export function loadAutoConfig(file) {
   }
   const auto = { ...DEFAULTS, ...((raw && raw.auto) || {}) };
   if (!(Number(auto.timeoutMinutes) > 0)) throw new Error(`${file}: auto.timeoutMinutes must be a number above 0`);
+  if (!(Number(auto.idleMinutes) > 0)) throw new Error(`${file}: auto.idleMinutes must be a number above 0`);
+  if (!(Number.isInteger(auto.retries) && auto.retries >= 0 && auto.retries <= 5)) throw new Error(`${file}: auto.retries must be a whole number from 0 to 5`);
+  if (!(Number(auto.retryDelaySeconds) >= 0)) throw new Error(`${file}: auto.retryDelaySeconds must be 0 or more`);
   if (auto.allowedTools != null && !Array.isArray(auto.allowedTools)) throw new Error(`${file}: auto.allowedTools must be a list`);
   return { ...auto, file, projectDir: path.dirname(path.resolve(file)) };
 }
@@ -159,7 +173,7 @@ export function buildPrompt({ frameDir, meta, plan, mapFile, cfg, large = false,
     'Steps:',
     `1. Use the figma-lens skill (if it is not available, read ${SKILL} first). Follow it exactly, including its "Large frames" rules when spec.md says the tree is split per section.`,
     '2. Follow this project\'s CLAUDE.md and its existing structure: put the screen where similar screens live, and reuse existing components, theme tokens and routing. Copy the assets you need from the export into the project\'s asset folders.',
-    `3. Install dependencies if they are missing. Start the dev server in the background (${fill(cfg.devServer) || "use the project's usual dev command"}; pick a free port). Then run`,
+    `3. Install dependencies only if they are missing, the fast way (npm: \`npm install --prefer-offline --no-audit --no-fund\`; Flutter: \`flutter pub get\`). Start the dev server in the background (${fill(cfg.devServer) || "use the project's usual dev command"}; pick a free port). Then run`,
     `   node "${CLI}" check --design "${frameDir}" --url ${fill(cfg.url) || '<the page URL>'}`,
     '   and fix until the mismatch is at most 3% or two runs in a row stop improving. Stop the dev server when you are done.',
     '4. Do not commit, push, switch branches or remove existing files. The user reviews this branch.',
@@ -199,6 +213,7 @@ export function claudeArgs({ cfg, frameDir }) {
   ];
   // Hooks (GateGuard prompts, review Stop hooks) would stall a run nobody can answer.
   if (!cfg.hooks) args.push('--settings', JSON.stringify({ disableAllHooks: true }));
+  if (cfg.model) args.push('--model', String(cfg.model));
   return args;
 }
 
@@ -269,7 +284,10 @@ export function createProgress({ frame, roots, started, log }) {
     if (!text || text === last) return;
     last = text;
     const s = Math.floor((Date.now() - started) / 1000);
-    log(`  [${frame} ${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}] ${text}`);
+    const stamp = c.gray(`[${frame} ${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}]`);
+    const score = text.match(/^check: ([\d.]+)% (.*)$/);
+    const body = text.startsWith('⚠') ? c.yellow(text) : score ? `${c.bold('check:')} ${pct(score[1])} ${score[2]}` : text;
+    log(`  ${stamp} ${body}`);
   };
   const onEvent = (ev) => {
     if (ev.type === 'result') {
@@ -320,8 +338,9 @@ export function createProgress({ frame, roots, started, log }) {
  * Plain-language explanation of a run that did not finish: what went wrong, why, and what to do next.
  * Returns { problem, cause, todo: [string] }.
  */
-export function explainFailure({ status, reason = '', timedOut = false, exitCode, timeoutMinutes, apiRetries = 0, imagesRead = 0, retryCmd, discardCmd }) {
+export function explainFailure({ status, reason = '', timedOut = false, idle = false, idleMinutes, attempts = 1, exitCode, timeoutMinutes, apiRetries = 0, imagesRead = 0, retryCmd, discardCmd }) {
   const r = String(reason);
+  const tried = attempts > 1 ? ` (tried ${attempts} times)` : '';
   const retry = `retry (continues from the partial files): ${retryCmd}`;
   // One command per line, so each can be copied and run as is (PowerShell 5.1 has no &&).
   const [rmWorktree, rmBranch] = Array.isArray(discardCmd) ? discardCmd : [discardCmd];
@@ -330,7 +349,14 @@ export function explainFailure({ status, reason = '', timedOut = false, exitCode
     return { problem: 'Claude finished without changing any file', cause: 'it stopped on purpose (a blocker, missing information); its report says why', todo: ['read the report, fix what it asks for', retry] };
   }
   if (timedOut) {
-    return { problem: `stopped by figma-lens after ${timeoutMinutes} minutes (auto.timeoutMinutes)`, cause: 'the run took longer than the time limit', todo: [retry, `or raise "timeoutMinutes" in figma-lens.config.json, or export a smaller frame`] };
+    return { problem: `stopped by figma-lens after ${timeoutMinutes} minutes (auto.timeoutMinutes)${tried}`, cause: 'the run took longer than the time limit', todo: [retry, `or raise "timeoutMinutes" in figma-lens.config.json, or export a smaller frame`] };
+  }
+  if (idle) {
+    return {
+      problem: `Claude Code stopped responding: no activity for ${idleMinutes} minutes${tried}`,
+      cause: 'the run froze (a stuck command, a dev server waiting in the foreground, or a dropped connection)',
+      todo: ['check your internet connection', retry, ...discard],
+    };
   }
   if (exitCode === -1) {
     return { problem: `Claude Code could not start: ${r}`, cause: 'the claude program was not found or could not run', todo: ['check that `claude --version` works in a terminal (or set "claude" in figma-lens.config.json)', retry] };
@@ -346,7 +372,7 @@ export function explainFailure({ status, reason = '', timedOut = false, exitCode
       ? `Claude had opened ${imagesRead} images; every image is re-sent with each request, which makes requests slow and fragile`
       : 'a network problem or the Claude service being busy';
     return {
-      problem: `Claude's API stopped answering ("${clip(r || 'request failed', 60)}"${apiRetries ? ` after ${apiRetries} retries` : ''})`,
+      problem: `Claude's API stopped answering ("${clip(r || 'request failed', 60)}"${apiRetries ? ` after ${apiRetries} retries` : ''})${tried}`,
       cause: heavy,
       todo: ['check your internet connection', retry, ...discard],
     };
@@ -400,10 +426,11 @@ export function prepareJob({ frameDir, configFile }) {
     }
     resume = previous === 'done' ? 'update' : 'partial';
   }
+  const promptArgs = { frameDir, meta, plan, mapFile, cfg, large };
   return {
-    cfg, meta, plan, mapSrc, mapFile, cmd, large, resume,
+    cfg, meta, plan, mapSrc, mapFile, cmd, large, resume, promptArgs,
     args: [...prefix, ...claudeArgs({ cfg, frameDir })],
-    prompt: buildPrompt({ frameDir, meta, plan, mapFile, cfg, large, resume }),
+    prompt: buildPrompt({ ...promptArgs, resume }),
   };
 }
 
@@ -419,7 +446,7 @@ export async function runJob({ frameDir, configFile, log = console.log }) {
   } catch (e) {
     const run = { ...base, status: e instanceof SkipError ? 'skipped' : 'failed', reason: e.message };
     writeRun(frameDir, run);
-    log(`⚠ auto: ${base.frame} ${run.status}: ${e.message}`);
+    log(`${c.yellow(c.bold('⚠ auto:'))} ${c.bold(base.frame)} ${c.yellow(run.status)}: ${e.message}`);
     return run;
   }
   const { cfg, plan } = job;
@@ -431,48 +458,37 @@ export async function runJob({ frameDir, configFile, log = console.log }) {
   fs.rmSync(path.join(frameDir, 'auto', 'report.md'), { force: true }); // never show last run's report as this run's
   const meta = { ...base, branch: plan.branch, worktree: plan.worktree, workDir: plan.workDir };
   writeRun(frameDir, { ...meta, status: 'running' });
-  log(`▶ auto: implementing ${base.frame} on ${plan.branch} (${plan.worktree})`);
-  log(`  progress below; details in ${path.join(frameDir, 'auto', 'claude.jsonl')}`);
-  const progress = createProgress({
-    frame: base.frame,
-    roots: [['', plan.workDir], ['export/', frameDir]],
-    started,
-    log,
-  });
+  log(`${c.cyan(c.bold('▶ auto:'))} implementing ${c.bold(base.frame)} on ${c.cyan(plan.branch)} ${c.gray(`(${plan.worktree})`)}`);
+  log(c.gray(`  progress below; details in ${path.join(frameDir, 'auto', 'claude.jsonl')}`));
 
-  const out = await new Promise((resolve) => {
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-    const child = spawn(job.cmd, job.args, { cwd: plan.workDir, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill();
-    }, cfg.timeoutMinutes * 60 * 1000);
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (c) => {
-      stdout += c;
+  // Attempts: the first, plus automatic retries for temporary problems (each continues the partial work).
+  const deadline = started + cfg.timeoutMinutes * 60 * 1000;
+  const maxAttempts = 1 + cfg.retries;
+  let out;
+  let allStdout = '';
+  for (let attempt = 1; ; attempt++) {
+    const progress = createProgress({ frame: base.frame, roots: [['', plan.workDir], ['export/', frameDir]], started, log });
+    let prompt = job.prompt;
+    if (attempt > 1) {
+      let partial = false;
       try {
-        progress.feed(c);
+        partial = git(['status', '--porcelain'], plan.worktree).length > 0;
       } catch {
-        // progress is cosmetic; never let it break the run
+        partial = false;
       }
-    });
-    child.stderr.on('data', (c) => (stderr += c));
-    child.on('error', (e) => {
-      clearTimeout(timer);
-      resolve({ code: -1, stdout, stderr: stderr + e.message, timedOut });
-    });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({ code, stdout, stderr, timedOut });
-    });
-    child.stdin.on('error', () => {}); // child exited before reading the prompt: reported via close/error
-    child.stdin.end(job.prompt);
-  });
-
-  out.result = progress.end();
-  out.stats = progress.stats();
+      prompt = buildPrompt({ ...job.promptArgs, resume: partial ? 'partial' : null });
+    }
+    out = await runClaude({ job, prompt, cwd: plan.workDir, progress, deadline, idleMs: cfg.idleMinutes * 60 * 1000 });
+    out.result = progress.end();
+    out.stats = progress.stats();
+    out.attempts = attempt;
+    allStdout += out.stdout;
+    const waitMs = cfg.retryDelaySeconds * 1000 * 3 ** (attempt - 1);
+    if (attempt >= maxAttempts || !isTransient(out) || Date.now() + waitMs >= deadline) break;
+    log(`${c.yellow(c.bold('↻ auto:'))} ${c.bold(base.frame)} hit a temporary problem (${clip(failureReason(out), 70)}); retrying in ${fmtDuration(waitMs)} ${c.gray(`(attempt ${attempt + 1}/${maxAttempts}, continues from the partial work)`)}`);
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+  out.stdout = allStdout;
   try {
     return finishRun({ frameDir, cfg, plan, meta, out, started, log });
   } catch (e) {
@@ -483,9 +499,77 @@ export async function runJob({ frameDir, configFile, log = console.log }) {
     } catch {
       // the export folder itself is gone; the log line below is all that is left
     }
-    log(`✖ auto: ${base.frame} failed to record its result: ${e.message}`);
+    log(`${c.red(c.bold('✖ auto:'))} ${c.bold(base.frame)} failed to record its result: ${e.message}`);
     return run;
   }
+}
+
+const fmtDuration = (ms) => (ms >= 60000 ? `${Math.round(ms / 60000)} min` : `${Math.round(ms / 1000)} s`);
+
+/** The reason text of a finished attempt (the result message, or stderr). */
+function failureReason(out) {
+  if (out.idle) return 'Claude Code stopped responding';
+  const r = out.result;
+  return String((r && (r.result || r.subtype)) || out.stderr || 'no result');
+}
+
+/** A problem a retry can fix: API timeout / busy service / network, or a frozen run. Never usage limit or login. */
+export function isTransient(out) {
+  if (out.timedOut) return false; // the overall time limit is a decision, not an accident
+  if (out.idle) return true;
+  const r = out.result;
+  if (r && r.subtype === 'success' && !r.is_error && out.code === 0) return false;
+  const reason = failureReason(out);
+  if (/usage limit|limit reached|quota|not logged in|login|authenticat|\b401\b|api key/i.test(reason)) return false;
+  return /timed out|timeout|overloaded|\b5\d\d\b|ECONN|network|socket|fetch failed/i.test(reason) || (out.stats && out.stats.apiRetries >= 3);
+}
+
+/** Run Claude Code once. Stops it at the deadline (timedOut) or after idleMs without any output (idle). */
+function runClaude({ job, prompt, cwd, progress, deadline, idleMs }) {
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    let idle = false;
+    let lastActivity = Date.now();
+    // Plain text for everything Claude runs: colored `check` output would hide the score from the progress parser.
+    const env = { ...process.env, NO_COLOR: '1' };
+    delete env.FORCE_COLOR;
+    const child = spawn(job.cmd, job.args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, Math.max(0, deadline - Date.now()));
+    const watch = setInterval(() => {
+      if (Date.now() - lastActivity > idleMs) {
+        idle = true;
+        child.kill();
+      }
+    }, Math.max(200, Math.min(30000, idleMs / 4)));
+    const done = (res) => {
+      clearTimeout(timer);
+      clearInterval(watch);
+      resolve({ ...res, timedOut, idle: idle && !timedOut });
+    };
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      lastActivity = Date.now();
+      stdout += chunk;
+      try {
+        progress.feed(chunk);
+      } catch {
+        // progress is cosmetic; never let it break the run
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      lastActivity = Date.now();
+      stderr += chunk;
+    });
+    child.on('error', (e) => done({ code: -1, stdout, stderr: stderr + e.message }));
+    child.on('close', (code) => done({ code, stdout, stderr }));
+    child.stdin.on('error', () => {}); // child exited before reading the prompt: reported via close/error
+    child.stdin.end(prompt);
+  });
 }
 
 function finishRun({ frameDir, cfg, plan, meta, out, started, log }) {
@@ -502,19 +586,22 @@ function finishRun({ frameDir, cfg, plan, meta, out, started, log }) {
     changes = null;
   }
   const changedFiles = changes ? changes.length : null;
-  let status = out.timedOut ? 'failed' : statusFrom(result, out.code);
+  let status = out.timedOut || out.idle ? 'failed' : statusFrom(result, out.code);
   if (status === 'done' && changedFiles === 0) status = 'no-changes';
   const run = {
     ...meta,
     status,
     changedFiles,
     exitCode: out.code,
+    attempts: out.attempts || 1,
     turns: result ? result.num_turns : null,
     durationMs: Date.now() - started,
     report: fs.existsSync(path.join(frameDir, 'auto', 'report.md')) ? 'auto/report.md' : null,
     reason: out.timedOut
       ? `stopped after ${cfg.timeoutMinutes} minutes`
-      : status === 'done'
+      : out.idle
+        ? `no activity for ${cfg.idleMinutes} minutes`
+        : status === 'done'
         ? undefined
         : status === 'no-changes'
           ? 'Claude finished without changing any file; see auto/report.md for why'
@@ -523,7 +610,7 @@ function finishRun({ frameDir, cfg, plan, meta, out, started, log }) {
   const reportFile = path.join(frameDir, 'auto', 'report.md');
   if (status === 'done') {
     writeRun(frameDir, run);
-    log(`✔ auto: ${meta.frame} done → review branch ${plan.branch}${run.report ? `, report ${reportFile}` : ''}`);
+    log(`${c.green(c.bold('✔ auto:'))} ${c.bold(meta.frame)} ${c.green('done')} → review branch ${c.cyan(plan.branch)}${run.report ? `, report ${c.gray(reportFile)}` : ''}`);
     return run;
   }
 
@@ -533,6 +620,9 @@ function finishRun({ frameDir, cfg, plan, meta, out, started, log }) {
     status,
     reason: run.reason,
     timedOut: out.timedOut,
+    idle: out.idle,
+    idleMinutes: cfg.idleMinutes,
+    attempts: out.attempts || 1,
     exitCode: out.code,
     timeoutMinutes: cfg.timeoutMinutes,
     apiRetries: stats.apiRetries,
@@ -571,11 +661,11 @@ function finishRun({ frameDir, cfg, plan, meta, out, started, log }) {
     run.report = 'auto/report.md';
   }
   writeRun(frameDir, run);
-  log(`✖ auto: ${meta.frame} ${status}: ${why.problem}`);
-  log(`  why: ${why.cause}`);
-  if (changedFiles) log(`  left behind: ${changedFiles} changed file(s) on ${plan.branch} (unfinished, not checked)`);
-  why.todo.forEach((t, i) => log(`  ${i === 0 ? 'next:' : '     '} ${t}`));
-  log(`  details: ${reportFile}`);
+  log(`${c.red(c.bold('✖ auto:'))} ${c.bold(meta.frame)} ${c.red(status)}: ${why.problem}`);
+  log(`  ${c.yellow('why:')} ${why.cause}`);
+  if (changedFiles) log(`  ${c.yellow('left behind:')} ${changedFiles} changed file(s) on ${c.cyan(plan.branch)} (unfinished, not checked)`);
+  why.todo.forEach((t, i) => log(`  ${i === 0 ? c.cyan('next:') : '     '} ${t}`));
+  log(`  ${c.gray(`details: ${reportFile}`)}`);
   return run;
 }
 

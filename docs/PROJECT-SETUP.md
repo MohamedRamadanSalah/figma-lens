@@ -129,7 +129,9 @@ figma-lens auto --init
     "devServer": "npm run dev -- --port {port} --strictPort",
     "url": "http://localhost:{port}/<feature-route>",
     "instructions": "Follow CLAUDE.md exactly. Use figma-lens.map.json for components. `npm run verify` must pass before you finish; list every added file grouped by folder in the report.",
-    "timeoutMinutes": 45
+    "timeoutMinutes": 300,
+    "idleMinutes": 20,
+    "retries": 2
   }
 }
 ```

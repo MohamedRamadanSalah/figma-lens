@@ -10,6 +10,8 @@ import { renderSpecFiles, summarizeUsage } from './render-md.js';
 import { planSections, cropSections } from './sections.js';
 import { findMap, loadMap } from '../tools/map.js';
 import { findConfig, loadAutoConfig, createQueue, runJob, CONFIG_FILE } from '../tools/auto.js';
+import { nameAssets } from './asset-names.js';
+import { c } from '../tools/colors.js';
 
 const VERSION = '0.2.0';
 const MARKER = '.figma-lens.json';
@@ -49,22 +51,23 @@ class HttpError extends Error {
 }
 
 /**
- * Everything derived from spec + screenshot: section crops, spec.json, spec.md (+ per-section
+ * Everything derived from spec + frame preview: section crops, spec.json, spec.md (+ per-section
  * spec files for large frames). Shared by the bridge and `figma-lens render`, which re-runs it
- * on an existing export. With a screenshot it replaces the export's sections/ folder (it only holds
+ * on an existing export. With the frame preview it replaces the export's sections/ folder (it only holds
  * generated files); without one it cannot re-crop, so it keeps the existing crops and only
  * replaces the section spec files.
  * Mutates meta (warnings, sectionPlan, sectionFiles). Returns the number of files written.
  */
 export async function writeDerived(dir, { meta, spec, tokens, usage, map, screenBuf }) {
-  const generated = (w) => /^section crops/.test(w) || /^screenshot is \d+×\d+px but/.test(w) || /^no screenshot: /.test(w);
+  // (also matches the older "screenshot" wording, so re-rendering an old export doesn't duplicate warnings)
+  const generated = (w) => /^section crops/.test(w) || /^(screenshot|frame preview) is \d+×\d+px but/.test(w) || /^no (screenshot|frame preview): /.test(w);
   meta.warnings = (Array.isArray(meta.warnings) ? meta.warnings : []).filter((w) => !generated(w));
   const plan = planSections(meta, spec);
   const sectionsDir = path.join(dir, 'sections');
   if (!screenBuf) {
     // Nothing to crop from: never delete crops we cannot regenerate.
     const kept = Array.isArray(meta.sectionFiles) ? meta.sectionFiles : [];
-    if (kept.length) meta.warnings.push('no screenshot: kept the existing section crops; they may not match the section list');
+    if (kept.length) meta.warnings.push('no frame preview: kept the existing section crops; they may not match the section list');
     const old = await fs.readdir(sectionsDir).catch(() => []);
     for (const f of old.filter((f) => f.endsWith('.md'))) await fs.rm(path.join(sectionsDir, f), { force: true });
     meta.sectionPlan = plan;
@@ -81,8 +84,8 @@ export async function writeDerived(dir, { meta, spec, tokens, usage, map, screen
       if (!(Math.abs(src.width - ew) <= 1 && Math.abs(src.height - eh) <= 1)) {
         // Never emit shifted crops: a wrong reference image is worse than none.
         meta.warnings.push(
-          `screenshot is ${src.width}×${src.height}px but the frame at ${scale}x should be ${ew}×${eh}px — ` +
-            'screenshot pixels do not map to spec coordinates; section crops skipped',
+          `frame preview is ${src.width}×${src.height}px but the frame at ${scale}x should be ${ew}×${eh}px — ` +
+            'preview pixels do not map to spec coordinates; section crops skipped',
         );
       } else {
         sectionFiles = cropSections(src, plan, scale);
@@ -151,7 +154,7 @@ async function writeIndex(outRoot) {
   const lines = [
     '# Figma exports (figma-lens)',
     '',
-    'Read `<folder>/spec.md` first, then look at the screenshot and section crops.',
+    'Read `<folder>/spec.md` first, then look at the frame preview and section crops.',
     '',
     '| Folder | Frame | Size | Figma file / page | Exported |',
     '|---|---|---|---|---|',
@@ -175,6 +178,9 @@ function mapFor(outRoot, mapFile, warnings) {
 export async function writeExport(outRoot, payload, { mapFile } = {}) {
   const { meta, spec, tokens, files } = payload || {};
   if (!meta || !spec || !Array.isArray(files)) throw new HttpError(400, 'payload needs meta, spec and files[]');
+  // Icons/images named after generic layers (container-12.svg) or hashes get names from their context.
+  const { renames } = nameAssets(spec, files.filter((f) => f && typeof f.path === 'string'));
+  if (Object.keys(renames).length) meta.assetRenames = renames;
   if (meta.tool !== 'figma-lens') throw new HttpError(400, 'not a figma-lens payload');
 
   for (const f of files) {
@@ -255,7 +261,7 @@ export function createBridge({ outRoot, mapFile, log = console.log, onExport } =
   return http.createServer(async (req, res) => {
     const origin = req.headers.origin;
     if (!originAllowed(origin)) {
-      log(`✖ blocked request from origin ${origin} (set FIGMA_LENS_ALLOW_ANY_ORIGIN=1 to allow)`);
+      log(`${c.red('✖')} blocked request from origin ${origin} ${c.gray('(set FIGMA_LENS_ALLOW_ANY_ORIGIN=1 to allow)')}`);
       send(res, 403, { ok: false, error: `origin ${origin} not allowed` });
       return;
     }
@@ -282,13 +288,13 @@ export function createBridge({ outRoot, mapFile, log = console.log, onExport } =
           throw new HttpError(400, 'body is not valid JSON');
         }
         const result = await writeExport(root, payload, { mapFile });
-        log(`✔ ${payload.meta.nodeName} → ${result.dir} (${result.files} files)`);
+        log(`${c.green('✔')} ${c.bold(payload.meta.nodeName)} exported → ${result.dir} ${c.gray(`(${result.files} files)`)}`);
         send(res, 200, { ok: true, ...result });
         if (onExport) {
           try {
             onExport(result.dir);
           } catch (e) {
-            log(`✖ auto: ${e.message}`);
+            log(`${c.red('✖ auto:')} ${e.message}`);
           }
         }
         return;
@@ -296,8 +302,8 @@ export function createBridge({ outRoot, mapFile, log = console.log, onExport } =
       send(res, 404, { ok: false, error: 'not found' });
     } catch (e) {
       const status = e.status || 500;
-      if (status === 500) log(`✖ ${e.stack || e.message}`);
-      else log(`✖ ${e.message}`);
+      if (status === 500) log(`${c.red('✖')} ${e.stack || e.message}`);
+      else log(`${c.red('✖')} ${e.message}`);
       if (!res.headersSent) send(res, status, { ok: false, error: e.message });
     }
   });
@@ -319,12 +325,12 @@ function parseArgs(argv) {
 export function autoHandler(outRoot, log = console.log) {
   const queue = createQueue(async (dir) => {
     const configFile = findConfig([outRoot, path.dirname(outRoot)]);
-    if (!configFile) return log(`⚠ auto: no ${CONFIG_FILE} next to ${outRoot} — run figma-lens auto --init in your project`);
-    if (!loadAutoConfig(configFile).enabled) return log(`⚠ auto: auto.enabled is false in ${configFile}`);
+    if (!configFile) return log(`${c.yellow('⚠ auto:')} no ${CONFIG_FILE} next to ${outRoot} — run ${c.bold('figma-lens auto --init')} in your project`);
+    if (!loadAutoConfig(configFile).enabled) return log(`${c.yellow('⚠ auto:')} auto.enabled is false in ${configFile}`);
     await runJob({ frameDir: dir, configFile, log });
   });
   const handle = (dir) => {
-    if (!queue.enqueue(dir)) log(`… auto: ${path.basename(dir)} is already waiting; it will use this export`);
+    if (!queue.enqueue(dir)) log(c.gray(`… auto: ${path.basename(dir)} is already waiting; it will use this export`));
   };
   handle.idle = queue.idle; // for tests: resolves when the queue is empty
   return handle;
@@ -342,12 +348,12 @@ export function startBridge({ port, out, map, auto } = {}) {
       process.exit(1);
     })
     .listen(port, '127.0.0.1', () => {
-      console.log(`figma-lens bridge ${VERSION} on http://localhost:${port}`);
-      console.log(`writing exports to ${outRoot}`);
-      console.log(`component map: ${mapFile || findMap([outRoot, path.dirname(outRoot)]) || '(none yet — run figma-lens map)'}`);
+      console.log(`${c.cyan(c.bold('figma-lens bridge'))} ${c.gray(VERSION)} on ${c.cyan(`http://localhost:${port}`)}`);
+      console.log(`${c.gray('writing exports to')} ${outRoot}`);
+      console.log(`${c.gray('component map:')} ${mapFile || findMap([outRoot, path.dirname(outRoot)]) || c.yellow('(none yet — run figma-lens map)')}`);
       if (auto) {
         const cfg = findConfig([outRoot, path.dirname(outRoot)]);
-        console.log(`auto mode: ON — each export is implemented by Claude Code on a figma/<frame> branch (${cfg || `no ${CONFIG_FILE} yet — run figma-lens auto --init`})`);
+        console.log(`${c.green(c.bold('auto mode: ON'))} — each export is implemented by Claude Code on a figma/<frame> branch ${c.gray(`(${cfg || `no ${CONFIG_FILE} yet — run figma-lens auto --init`})`)}`);
       }
     });
   createBridge({ outRoot, mapFile, onExport })
