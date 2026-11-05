@@ -101,6 +101,96 @@ test('status bar crop and a taller build are handled', () => {
   assert.match(fs.readFileSync(r.reportFile, 'utf8'), /30 units taller/);
 });
 
+// Fake text: glyph-like stems with anti-aliased edges at (20,60) design units, 2x. `shift` moves the
+// whole run by N device pixels, `edge` is the AA edge value, `stem`/`pitch` change the "font".
+function drawText(img, { shift = 0, edge = 140, stem = 4, pitch = 10, ink = [17, 17, 17], x = 20, y = 60 } = {}) {
+  const px = (xx, yy, v) => img.data.set(v, (yy * img.width + xx) * 4);
+  const mix = (t) => ink.map((c, k) => Math.round(c * t + 255 * (1 - t))).concat(255);
+  for (let g = 0; g < 12; g++) {
+    const x0 = x * 2 + 4 + g * pitch + shift;
+    for (let yy = y * 2 + 6; yy < y * 2 + 26; yy++) {
+      px(x0 - 1, yy, mix(1 - edge / 255));
+      for (let k = 0; k < stem; k++) px(x0 + k, yy, mix(1));
+      px(x0 + stem, yy, mix(1 - edge / 255));
+    }
+  }
+  return img;
+}
+
+function addTextLayer(dir) {
+  const file = path.join(dir, 'spec.json');
+  const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+  j.spec.children.push({ id: '1:9', name: 'Label', type: 'TEXT', box: { x: 20, y: 60, w: 70, h: 16 }, rel: { x: 20, y: 60 },
+    text: { characters: 'Hello world', font: 'Inter', size: 14 } });
+  fs.writeFileSync(file, JSON.stringify(j));
+}
+
+function textCase(actualOpts) {
+  const root = tmp();
+  const dir = makeExport(root);
+  addTextLayer(dir);
+  writePng(path.join(dir, 'screen@2x.png'), drawText(drawScreen()));
+  const shot = path.join(root, 'build.png');
+  writePng(shot, drawText(drawScreen(), actualOpts));
+  return { dir, shot };
+}
+
+test('text tolerance is opt-in: strict by default, glyph jitter ignored only with textToleranceUnits', () => {
+  // Glyphs 1px off and half a unit heavier with other edge anti-aliasing (ink within 25%). pixelmatch
+  // alone flags it (its AA check only covers 1px edge shifts). Synthetic: real fonts behave worse, see README.
+  const { dir, shot } = textCase({ shift: 1, stem: 5, edge: 200 });
+  const strict = computeDiff({ designDir: dir, actualFile: shot }).stats;
+  assert.equal(strict.metric, 'pixel');
+  assert.equal(strict.mismatchPct, strict.rawMismatchPct);
+  assert.ok(strict.mismatchPct > 0.2, `strict ${strict.mismatchPct}%`);
+  assert.equal(strict.text.ignoredNoisePx, 0);
+  assert.deepEqual(strict.text.suspects, []);
+
+  const { stats } = computeDiff({ designDir: dir, actualFile: shot, textToleranceUnits: 1 });
+  assert.equal(stats.metric, 'text-tolerant-1');
+  assert.equal(stats.rawMismatchPct, strict.rawMismatchPct);
+  assert.ok(stats.mismatchPct < 0.1, `tolerant ${stats.mismatchPct}%`);
+  assert.ok(stats.text.ignoredNoisePx > 0);
+  assert.equal(stats.regions.length, 0, JSON.stringify(stats.regions));
+});
+
+test('real text differences still count: wrong font metrics, wrong color, moved label', () => {
+  for (const [why, opts] of [
+    ['wider font', { stem: 6, pitch: 13 }],
+    ['wrong color', { ink: [150, 150, 150] }],
+    ['moved 10 units', { y: 70 }],
+    ['bolder weight, same advance', { stem: 6 }],
+  ]) {
+    // even with the tolerance on
+    const { dir, shot } = textCase(opts);
+    const r = compare({ designDir: dir, actualFile: shot, textToleranceUnits: 1 });
+    assert.ok(r.mismatchPct > 0.2, `${why}: ${r.mismatchPct}%`);
+    assert.ok(r.text.mismatchPct > 3, `${why}: text ${r.text.mismatchPct}%`);
+    const named = r.regions.flatMap((g) => g.nodes.map((n) => n.id));
+    assert.ok(named.includes('1:9'), `${why}: regions name ${JSON.stringify(named)}`);
+  }
+  // A heavier weight is reported as a suspect with its ink ratio.
+  const { dir, shot } = textCase({ stem: 6 });
+  const r = compare({ designDir: dir, actualFile: shot });
+  assert.deepEqual(r.text.suspects.map((s) => s.id), ['1:9']);
+  assert.ok(r.text.suspects[0].inkRatio > 1.25);
+  assert.match(fs.readFileSync(r.reportFile, 'utf8'), /`1:9` "Label" has [\d.]+× the ink \(heavier/);
+});
+
+test('previous-run trend only compares runs scored with the same metric', () => {
+  const { dir, shot } = textCase({ shift: 1 });
+  fs.mkdirSync(path.join(dir, 'compare'), { recursive: true });
+  // an entry from before metrics were recorded was a plain pixel score
+  fs.writeFileSync(path.join(dir, 'compare', 'history.json'), JSON.stringify([{ at: 'x', mismatchPct: 9.9 }]));
+  assert.equal(compare({ designDir: dir, actualFile: shot }).previousMismatchPct, 9.9);
+  // switching the tolerance on starts a new trend instead of comparing two metrics
+  assert.equal(compare({ designDir: dir, actualFile: shot, textToleranceUnits: 1 }).previousMismatchPct, null);
+  const second = compare({ designDir: dir, actualFile: shot, textToleranceUnits: 1 });
+  assert.equal(second.previousMismatchPct, second.mismatchPct);
+  const history = JSON.parse(fs.readFileSync(path.join(dir, 'compare', 'history.json'), 'utf8'));
+  assert.deepEqual(history.map((h) => h.metric), [undefined, 'pixel', 'text-tolerant-1', 'text-tolerant-1']);
+});
+
 test('resize keeps solid colors exact', () => {
   const img = blank(10, 10, [10, 20, 30, 255]);
   const out = resize(img, 25, 25);

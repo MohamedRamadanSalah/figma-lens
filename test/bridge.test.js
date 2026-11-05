@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { PNG } from 'pngjs';
-import { createBridge, folderSlug, originAllowed } from '../bridge/server.js';
+import { createBridge, folderSlug, originAllowed, swapInto } from '../bridge/server.js';
 
 function pngBase64(w, h) {
   const png = new PNG({ width: w, height: h });
@@ -243,4 +243,184 @@ test('folder slug keeps Arabic names and falls back for empty ones', () => {
   assert.equal(folderSlug('الصفحة الرئيسية'), 'الصفحة-الرئيسية');
   assert.equal(folderSlug('Home / Screen 1'), 'home-screen-1');
   assert.equal(folderSlug('***', 'node-1:2'), 'node-1-2');
+});
+
+// ---------- streamed export (plugin 0.2+): one raw request per file, no base64 ----------
+
+async function streamExport(base, p, { skipFinish = false, headers = { Origin: 'null' } } = {}) {
+  const start = await (await fetch(base + '/exports', { method: 'POST', headers })).json();
+  assert.equal(start.ok, true);
+  for (const f of p.files) {
+    const r = await fetch(`${base}/exports/${start.id}/files?path=${encodeURIComponent(f.path)}`, {
+      method: 'POST', headers: { ...headers, 'Content-Type': 'application/octet-stream' }, body: Buffer.from(f.base64, 'base64'),
+    });
+    assert.equal(r.status, 200, await r.text());
+  }
+  if (skipFinish) return { id: start.id };
+  const { files, ...rest } = p;
+  const r = await fetch(`${base}/exports/${start.id}/finish`, {
+    method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...rest, files: files.map((f) => f.path) }),
+  });
+  return { id: start.id, r, j: await r.json() };
+}
+
+test('streamed export writes the same folder as the single-request export, byte for byte', async () => {
+  await withBridge(async ({ base, outRoot }) => {
+    const h = await (await fetch(base + '/health')).json();
+    assert.equal(h.upload, 1); // the plugin uses this to pick the streamed protocol
+    const p = payload();
+    const { r, j } = await streamExport(base, p);
+    assert.equal(r.status, 200, JSON.stringify(j));
+    const dir = path.join(outRoot, 'login-screen');
+    assert.equal(j.dir, dir);
+    for (const f of ['spec.json', 'spec.md', 'tokens.json', 'sections/01-header.png']) await fs.access(path.join(dir, f));
+    for (const f of p.files) assert.deepEqual(await fs.readFile(path.join(dir, f.path)), Buffer.from(f.base64, 'base64'));
+    // staging is cleaned up and never shows up as an export
+    assert.deepEqual(await fs.readdir(path.join(outRoot, '.figma-lens-uploads')), []);
+    assert.doesNotMatch(await fs.readFile(path.join(outRoot, 'INDEX.md'), 'utf8'), /figma-lens-uploads/);
+  });
+});
+
+test('a failed or abandoned streamed export never touches the previous good export', async () => {
+  await withBridge(async ({ base, outRoot }) => {
+    assert.equal((await streamExport(base, payload())).r.status, 200);
+    const dir = path.join(outRoot, 'login-screen');
+    const before = await fs.readFile(path.join(dir, 'spec.md'), 'utf8');
+
+    // finish lists a file that never arrived -> rejected, old export intact
+    const p = payload();
+    const { id } = await streamExport(base, { ...p, files: p.files.slice(0, 1) }, { skipFinish: true });
+    const { files, ...rest } = p;
+    const bad = await fetch(`${base}/exports/${id}/finish`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...rest, files: files.map((f) => f.path) }),
+    });
+    assert.equal(bad.status, 400);
+    assert.match((await bad.json()).error, /not uploaded: assets\/icon-arrow-right\.svg/);
+    assert.equal(await fs.readFile(path.join(dir, 'spec.md'), 'utf8'), before);
+    // the session is gone after a failed finish
+    assert.equal((await fetch(`${base}/exports/${id}/finish`, { method: 'POST', body: '{}' })).status, 404);
+
+    // abort removes the staged files
+    const ab = await streamExport(base, payload(), { skipFinish: true });
+    assert.equal((await fetch(`${base}/exports/${ab.id}/abort`, { method: 'POST' })).status, 200);
+    assert.deepEqual(await fs.readdir(path.join(outRoot, '.figma-lens-uploads')), []);
+    assert.equal(await fs.readFile(path.join(dir, 'spec.md'), 'utf8'), before);
+  });
+});
+
+test('streamed uploads reject unsafe paths, reserved names and foreign origins', async () => {
+  await withBridge(async ({ base, outRoot }) => {
+    const { id } = await (await fetch(base + '/exports', { method: 'POST' })).json();
+    for (const bad of ['../evil.txt', 'a/../../evil.txt', '/abs.txt', '.figma-lens.json', 'auto/run.json', 'Auto/x', '']) {
+      const r = await fetch(`${base}/exports/${id}/files?path=${encodeURIComponent(bad)}`, { method: 'POST', body: 'x' });
+      assert.equal(r.status, 400, bad);
+    }
+    await assert.rejects(fs.access(path.join(outRoot, '..', 'evil.txt')));
+    const evil = await fetch(base + '/exports', { method: 'POST', headers: { Origin: 'https://evil.example' } });
+    assert.equal(evil.status, 403);
+    assert.equal((await fetch(`${base}/exports/00000000-0000-0000-0000-000000000000/files?path=a.png`, { method: 'POST', body: 'x' })).status, 404);
+  });
+});
+
+// ---------- the previous export survives every failure ----------
+
+async function snapshot(dir) {
+  const out = {};
+  async function walk(rel) {
+    for (const e of await fs.readdir(path.join(dir, rel), { withFileTypes: true })) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) await walk(r);
+      else out[r] = (await fs.readFile(path.join(dir, r))).toString('base64');
+    }
+  }
+  await walk('');
+  return out;
+}
+
+test('a file listed twice is rejected before anything is written (streamed and single request)', async () => {
+  await withBridge(async ({ base, outRoot }) => {
+    assert.equal((await streamExport(base, payload())).r.status, 200);
+    const dir = path.join(outRoot, 'login-screen');
+    const before = await snapshot(dir);
+
+    const p = payload();
+    const { id } = await streamExport(base, p, { skipFinish: true });
+    const { files, ...rest } = p;
+    const dup = await fetch(`${base}/exports/${id}/finish`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...rest, files: [...files.map((f) => f.path), 'screen@2x.png'] }),
+    });
+    assert.equal(dup.status, 400);
+    assert.match((await dup.json()).error, /listed twice: screen@2x\.png/);
+
+    const legacy = payload();
+    legacy.files = [...legacy.files, { ...legacy.files[1], path: 'ASSETS/icon-arrow-right.svg' }]; // same file on Windows/macOS
+    const r = await post(base, legacy);
+    assert.equal(r.status, 400);
+    assert.deepEqual(await snapshot(dir), before);
+  });
+});
+
+test('a failure while building the new export leaves the previous export byte for byte', async () => {
+  await withBridge(async ({ base, outRoot }) => {
+    assert.equal((await streamExport(base, payload())).r.status, 200);
+    const dir = path.join(outRoot, 'login-screen');
+    await fs.mkdir(path.join(dir, 'auto'));
+    await fs.writeFile(path.join(dir, 'auto', 'run.json'), '{"status":"running"}');
+    const before = await snapshot(dir);
+
+    // the staged screenshot disappears before finish: placing it fails after validation passed
+    const p = payload();
+    const { id } = await streamExport(base, p, { skipFinish: true });
+    const staging = path.join(outRoot, '.figma-lens-uploads', id);
+    await fs.rm(path.join(staging, 'screen@2x.png'));
+    const { files, ...rest } = p;
+    const r = await fetch(`${base}/exports/${id}/finish`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...rest, files: files.map((f) => f.path) }),
+    });
+    assert.equal(r.status, 500);
+    assert.deepEqual(await snapshot(dir), before);
+    assert.deepEqual(await fs.readdir(path.join(outRoot, '.figma-lens-uploads')), []); // work folders cleaned up
+    // and the frame still owns its folder: the next export goes to the same place
+    const again = await streamExport(base, payload());
+    assert.equal(again.j.dir, dir);
+  });
+});
+
+test('swapInto: a failed move mid-swap puts the old export back; auto/ and the marker are never moved out', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'figma-lens-swap-'));
+  try {
+    const dir = path.join(root, 'frame');
+    const built = path.join(root, 'build');
+    for (const [f, text] of [['.figma-lens.json', 'old marker'], ['spec.md', 'old spec'], ['assets/a.svg', 'old a'], ['auto/run.json', 'run']]) {
+      await fs.mkdir(path.dirname(path.join(dir, f)), { recursive: true });
+      await fs.writeFile(path.join(dir, f), text);
+    }
+    for (const [f, text] of [['.figma-lens.json', 'new marker'], ['spec.md', 'new spec'], ['assets/b.svg', 'new b'], ['tokens.json', 'new tokens']]) {
+      await fs.mkdir(path.dirname(path.join(built, f)), { recursive: true });
+      await fs.writeFile(path.join(built, f), text);
+    }
+    const before = await snapshot(dir);
+    let moves = 0;
+    const flaky = async (a, b) => {
+      if (++moves === 4) throw Object.assign(new Error('EBUSY: file is open'), { code: 'EBUSY' }); // 2 out, then fail on the 2nd in
+      await fs.rename(a, b);
+    };
+    await assert.rejects(swapInto(dir, built, { rename: flaky }), /EBUSY/);
+    assert.deepEqual(await snapshot(dir), before);
+    await assert.rejects(fs.access(built + '-old'));
+
+    // and without the failure: new contents, auto/ kept, marker replaced
+    const fresh = path.join(root, 'build2');
+    await fs.mkdir(fresh);
+    await fs.writeFile(path.join(fresh, '.figma-lens.json'), 'new marker');
+    await fs.writeFile(path.join(fresh, 'spec.md'), 'new spec');
+    await swapInto(dir, fresh);
+    const after = await snapshot(dir);
+    assert.deepEqual(Object.keys(after).sort(), ['.figma-lens.json', 'auto/run.json', 'spec.md']);
+    assert.equal(Buffer.from(after['.figma-lens.json'], 'base64').toString(), 'new marker');
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });

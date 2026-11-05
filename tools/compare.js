@@ -7,6 +7,7 @@ import { PNG } from 'pngjs';
 import { readPng, writePng, crop, resize, flatten, hstack, shrinkMax } from './image.js';
 
 const DIFF_COLOR = [255, 0, 64];
+const AA_COLOR = [255, 210, 0];
 const PANEL_MAX = 900; // px: max width of each panel in side-by-side.png
 const r1 = (n) => Math.round(n * 10) / 10;
 
@@ -90,11 +91,99 @@ function findRegions(mask, W, H, scale, cellUnits, frame, nodes) {
   return regions.sort((a, b) => b.diffPixels - a.diffPixels);
 }
 
+// How a score was computed, recorded in history.json so the "previous run" trend never compares two
+// different metrics. Runs from before this field existed were plain pixel scores.
+export const metricFor = (textToleranceUnits) => (textToleranceUnits > 0 ? `text-tolerant-${textToleranceUnits}` : 'pixel');
+
+// Perceived color distance (YIQ, same idea as pixelmatch) between two opaque RGBA pixels.
+function colorDelta(a, i, b, j) {
+  const dr = a[i] - b[j], dg = a[i + 1] - b[j + 1], db = a[i + 2] - b[j + 2];
+  const y = dr * 0.29889531 + dg * 0.58662247 + db * 0.11448223;
+  const iq = dr * 0.59597799 - dg * 0.2741761 - db * 0.32180189;
+  const q = dr * 0.21147017 - dg * 0.52261711 + db * 0.31114694;
+  return 0.5053 * y * y + 0.299 * iq * iq + 0.1957 * q * q;
+}
+
+// True when pixel (x,y) of `src` has a close-colored pixel in `other` within `r` px.
+function nearMatch(src, other, W, H, x, y, r, maxDelta) {
+  const i = (y * W + x) * 4;
+  for (let yy = Math.max(0, y - r); yy <= Math.min(H - 1, y + r); yy++) {
+    for (let xx = Math.max(0, x - r); xx <= Math.min(W - 1, x + r); xx++) {
+      if (colorDelta(src, i, other, (yy * W + xx) * 4) <= maxDelta) return true;
+    }
+  }
+  return false;
+}
+
+const INK_TOLERANCE = 0.25; // text with ±25% more/less ink than the design is a real weight/size/color change
+
+// Total "ink" in a box: how far each pixel is from the box's background color (the most common one).
+function inkIn(img, W, b, bg) {
+  let ink = 0;
+  for (let y = b.y0; y < b.y1; y++) for (let x = b.x0; x < b.x1; x++) ink += Math.sqrt(colorDelta(img.data, (y * W + x) * 4, bg, 0));
+  return ink;
+}
+
+function backgroundOf(img, W, b) {
+  const counts = new Map();
+  let best = 0, key = 0;
+  for (let y = b.y0; y < b.y1; y++) {
+    for (let x = b.x0; x < b.x1; x++) {
+      const i = (y * W + x) * 4;
+      const k = (img.data[i] << 16) | (img.data[i + 1] << 8) | img.data[i + 2];
+      const n = (counts.get(k) || 0) + 1;
+      counts.set(k, n);
+      if (n > best) { best = n; key = k; }
+    }
+  }
+  return [(key >> 16) & 255, (key >> 8) & 255, key & 255, 255];
+}
+
+/**
+ * Where font rendering noise may be forgiven. Font rasterizers (Figma vs Chrome/Skia vs Flutter) place
+ * glyph edges and hinting differently by a pixel or so; that is noise, not a bug. A TEXT layer only
+ * qualifies when both images hold about the same amount of ink in its box; otherwise (bolder/lighter
+ * weight, other size, other color) it is compared strictly and returned as a suspect.
+ */
+function textAreas(nodes, d, a, W, H, scale) {
+  const ok = [], bad = [];
+  for (const { node } of nodes) {
+    if (node.type !== 'TEXT' || !node.box) continue;
+    const b = {
+      x0: Math.max(0, Math.floor(node.box.x * scale)), y0: Math.max(0, Math.floor(node.box.y * scale)),
+      x1: Math.min(W, Math.ceil((node.box.x + node.box.w) * scale)), y1: Math.min(H, Math.ceil((node.box.y + node.box.h) * scale)),
+    };
+    if (b.x1 <= b.x0 || b.y1 <= b.y0) continue;
+    const bg = backgroundOf(d, W, b);
+    const inkD = inkIn(d, W, b, bg), inkA = inkIn(a, W, b, bg);
+    const ratio = inkD > 0 ? inkA / inkD : inkA > 0 ? Infinity : 1;
+    if (Math.abs(ratio - 1) <= INK_TOLERANCE) ok.push(b);
+    else bad.push({ b, suspect: { id: node.id, name: node.name, inkRatio: Number.isFinite(ratio) ? r1(ratio) : null } });
+  }
+  if (!ok.length && !bad.length) return { tolerant: null, inText: null, suspects: [] };
+  const fill = (m, b, v) => { for (let y = b.y0; y < b.y1; y++) m.fill(v, y * W + b.x0, y * W + b.x1); };
+  const inText = new Uint8Array(W * H);
+  for (const b of ok) fill(inText, b, 1);
+  for (const { b } of bad) fill(inText, b, 1);
+  let tolerant = null;
+  if (ok.length) {
+    tolerant = new Uint8Array(W * H);
+    for (const b of ok) fill(tolerant, b, 1);
+    for (const { b } of bad) fill(tolerant, b, 0); // overlapping suspect text stays strict
+  }
+  return { tolerant, inText, suspects: bad.map((x) => x.suspect) };
+}
+
 /**
  * Pure comparison (no files written). Returns images + stats.
  * cropTop/cropBottom are in pixels of the ACTUAL screenshot (e.g. a phone status bar).
+ * Text tolerance (EXPERIMENTAL, off by default): with textToleranceUnits > 0, a differing pixel inside a
+ * TEXT layer is ignored when the other image has a matching color within that many design units, both
+ * ways. Measured on real browser text it removes only about half of subpixel rendering noise and can
+ * hide a one-letter change ("Continue" → "Continua"), so it is opt-in and never the default gate.
+ * Text suspects (ink ±25%: weight/size/color) and the raw score are reported either way.
  */
-export function computeDiff({ designDir, actualFile, cropTop = 0, cropBottom = 0, threshold = 0.1, cellUnits = 8 }) {
+export function computeDiff({ designDir, actualFile, cropTop = 0, cropBottom = 0, threshold = 0.1, cellUnits = 8, textToleranceUnits = 0 }) {
   const { meta, spec, screen } = loadDesign(designDir);
   // Pixels per design unit, measured from the image itself (robust if it isn't exactly frame × meta.scale).
   const scale = meta.width ? screen.width / meta.width : meta.scale || 1;
@@ -112,15 +201,35 @@ export function computeDiff({ designDir, actualFile, cropTop = 0, cropBottom = 0
   const a = H === actual.height ? actual : crop(actual, 0, 0, W, H);
   const diff = new PNG({ width: W, height: H });
   const diffPixels = pixelmatch(d.data, a.data, diff.data, W, H, {
-    threshold, includeAA: false, alpha: 0.25, diffColor: DIFF_COLOR, aaColor: [255, 210, 0],
+    threshold, includeAA: false, alpha: 0.25, diffColor: DIFF_COLOR, aaColor: AA_COLOR,
   });
 
-  const mask = new Uint8Array(W * H);
-  for (let i = 0, p = 0; p < W * H; i += 4, p++) {
-    if (diff.data[i] === DIFF_COLOR[0] && diff.data[i + 1] === DIFF_COLOR[1] && diff.data[i + 2] === DIFF_COLOR[2]) mask[p] = 1;
-  }
   const frame = { w: meta.width, h: meta.height };
   const nodes = flattenNodes(spec);
+  const { tolerant, inText, suspects } = textAreas(nodes, d, a, W, H, scale);
+  const forgive = textToleranceUnits > 0 ? tolerant : null;
+  const r = Math.max(1, Math.round(textToleranceUnits * scale));
+  // Same color threshold as pixelmatch: only position is forgiven, so a wrong text color still counts.
+  const maxDelta = 35215 * threshold * threshold;
+  const mask = new Uint8Array(W * H);
+  let diffCount = 0, textNoise = 0, textDiff = 0, textPx = 0;
+  for (let i = 0, p = 0; p < W * H; i += 4, p++) {
+    const isText = inText !== null && inText[p] === 1;
+    if (isText) textPx++;
+    if (!(diff.data[i] === DIFF_COLOR[0] && diff.data[i + 1] === DIFF_COLOR[1] && diff.data[i + 2] === DIFF_COLOR[2])) continue;
+    if (forgive && forgive[p]) {
+      const x = p % W, y = (p - x) / W;
+      // Both directions: a glyph pixel in Figma has a twin nearby in the build AND vice versa.
+      if (nearMatch(d.data, a.data, W, H, x, y, r, maxDelta) && nearMatch(a.data, d.data, W, H, x, y, r, maxDelta)) {
+        textNoise++;
+        diff.data.set(AA_COLOR, i); // diff.png: red = counted, amber = forgiven rendering noise
+        continue;
+      }
+    }
+    if (isText) textDiff++;
+    mask[p] = 1;
+    diffCount++;
+  }
   const regions = findRegions(mask, W, H, scale, cellUnits, frame, nodes);
 
   const sections = (meta.sectionFiles || []).map((s) => {
@@ -137,8 +246,16 @@ export function computeDiff({ designDir, actualFile, cropTop = 0, cropBottom = 0
     actual: a,
     diff,
     stats: {
-      mismatchPct: r1((diffPixels / (W * H)) * 100),
-      diffPixels,
+      metric: metricFor(textToleranceUnits),
+      mismatchPct: r1((diffCount / (W * H)) * 100),
+      diffPixels: diffCount,
+      rawMismatchPct: r1((diffPixels / (W * H)) * 100), // plain pixelmatch, before text tolerance
+      text: {
+        pixels: textPx,
+        mismatchPct: textPx ? r1((textDiff / textPx) * 100) : null, // real text differences, % of text area
+        ignoredNoisePx: textNoise,
+        suspects, // text layers whose ink differs a lot: weight, size or color (compared strictly)
+      },
       comparedPx: { w: W, h: H },
       heightDelta: r1((actual.height - design.height) / scale), // design units; + = build is taller
       regions,
@@ -154,7 +271,18 @@ function reportMarkdown(meta, stats, files, prev) {
   const trend = prev != null ? ` (previous run ${prev}%)` : '';
   out.push(`**Mismatch: ${stats.mismatchPct}%** of compared pixels${trend}. Target: under 2–3% (text anti-aliasing never reaches 0).`);
   out.push('');
-  out.push(`Images: \`${files.sideBySide}\` (Figma | build | diff) and \`${files.diff}\` (red = different).`);
+  if (stats.text.pixels) {
+    out.push(stats.text.ignoredNoisePx
+      ? `Text: ${stats.text.mismatchPct}% of the text area differs after ignoring ${stats.text.ignoredNoisePx} px of glyph rendering noise ` +
+        `(experimental --text-tolerance; it can also hide one-letter changes). The plain pixel diff is ${stats.rawMismatchPct}%.`
+      : `Text: ${stats.text.mismatchPct}% of the text area differs.`);
+    for (const s of stats.text.suspects.slice(0, 8)) {
+      const how = s.inkRatio == null ? 'has text only in the build' : s.inkRatio > 1 ? `has ${s.inkRatio}× the ink (heavier/bigger/darker)` : `has ${s.inkRatio}× the ink (lighter/smaller/paler or missing)`;
+      out.push(`- ⚠ \`${s.id}\` "${s.name}" ${how} — check font weight, size and color in spec.md`);
+    }
+    out.push('');
+  }
+  out.push(`Images: \`${files.sideBySide}\` (Figma | build | diff) and \`${files.diff}\` (red = different${stats.text.ignoredNoisePx ? ', amber = ignored as font rendering noise' : ''}).`);
   if (Math.abs(stats.heightDelta) >= 2) {
     out.push('');
     out.push(`⚠ The build is **${Math.abs(stats.heightDelta)} units ${stats.heightDelta > 0 ? 'taller' : 'shorter'}** than the frame (${meta.width}×${meta.height}). ` +
@@ -202,8 +330,11 @@ export function compare(opts) {
   const historyFile = path.join(outDir, 'history.json');
   let history = [];
   try { history = JSON.parse(fs.readFileSync(historyFile, 'utf8')); } catch { history = []; }
-  const prev = history.length ? history[history.length - 1].mismatchPct : null;
-  history.push({ at: new Date().toISOString(), mismatchPct: stats.mismatchPct, actual: path.resolve(opts.actualFile) });
+  if (!Array.isArray(history)) history = [];
+  // Only a run scored the same way is a fair "previous".
+  const last = history.length ? history[history.length - 1] : null;
+  const prev = last && (last.metric || 'pixel') === stats.metric ? last.mismatchPct : null;
+  history.push({ at: new Date().toISOString(), metric: stats.metric, mismatchPct: stats.mismatchPct, rawMismatchPct: stats.rawMismatchPct, actual: path.resolve(opts.actualFile) });
   fs.writeFileSync(historyFile, JSON.stringify(history, null, 1));
 
   const report = { frame: meta.nodeName, ...stats, files, previousMismatchPct: prev };
