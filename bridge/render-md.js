@@ -331,7 +331,19 @@ function renderMarkdownInner(payload, usage, map, cut = null) {
   out.push('- `→ assets/x.svg` = this layer is an icon/vector exported as SVG; use the file, do not redraw it.');
   out.push('');
 
-  if (meta.truncated) out.push('> ⚠ Layer limit reached — this tree is incomplete. Export smaller frames.\n');
+  if (meta.truncated) {
+    const skipped = Array.isArray(meta.skipped) ? meta.skipped : [];
+    const total = meta.skippedCount || skipped.length;
+    const shown = Math.min(40, skipped.length);
+    out.push(`> ⚠ Layer limit${meta.maxLayers ? ` (${meta.maxLayers})` : ''} reached — ${total ? `${total} layer subtree(s) are` : 'part of the tree is'} missing below. ` +
+      'They are still in the frame preview. Export them on their own (select them in Figma), or raise "Max layers" in the plugin (0 = no limit).');
+    for (const s of skipped.slice(0, shown)) out.push(`> - \`${s.id}\` ${s.type} ${quote(s.name)} at ${num(s.box.x)},${num(s.box.y)} ${num(s.box.w)}×${num(s.box.h)}`);
+    if (total > shown) out.push(`> - … and ${total - shown} more${skipped.length > shown ? ' (spec.json → meta.skipped lists up to 200)' : ''}`);
+    out.push('');
+  }
+  if (meta.css && meta.css.candidates > meta.css.added) {
+    out.push(`> CSS was added to ${meta.css.added} of ${meta.css.candidates} styled layers (plugin "CSS limit" ${meta.css.limit || 'none'}). The spec above is complete either way; CSS is extra.\n`);
+  }
   if (meta.warnings && meta.warnings.length) {
     out.push('## Warnings');
     for (const w of meta.warnings) out.push(`- ${w}`);

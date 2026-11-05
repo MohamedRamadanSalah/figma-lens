@@ -25,7 +25,7 @@ Usage:
   figma-lens auto    --design design/<frame> [--config ${CONFIG_FILE}] [--dry-run]
       Run (or with --dry-run: only print) the Claude Code job for one export, e.g. to retry it.
 
-  figma-lens check   --design design/<frame> (--url <page url> | --adb) [--viewport] [--crop-top px] [--crop-bottom px] [--fail-above pct]
+  figma-lens check   --design design/<frame> (--url <page url> | --adb) [--viewport] [--crop-top px] [--crop-bottom px] [--fail-above pct] [--text-tolerance units]
       Render your build and compare it with the Figma frame (shot + compare in one step).
       Web pages are captured full-page, so a build taller than the frame is reported instead of
       cut off. --viewport captures only the frame-sized viewport (e.g. a scrolling app screen
@@ -35,8 +35,10 @@ Usage:
   figma-lens shot    --adb [--serial id] --out shot.png
       Render a web page (or Flutter web) at the frame's size, or an Android device/emulator, as an image.
 
-  figma-lens compare --design design/<frame> --actual shot.png [--crop-top px] [--crop-bottom px] [--out dir] [--fail-above pct]
+  figma-lens compare --design design/<frame> --actual shot.png [--crop-top px] [--crop-bottom px] [--out dir] [--fail-above pct] [--text-tolerance units]
       Diff an image of your build against the frame. Writes compare/{report.md,report.json,diff.png,side-by-side.png}.
+      --text-tolerance 1 (experimental, off by default) ignores glyph edges off by up to 1 design unit
+      inside text layers; it can also hide one-letter text changes. Text suspects are always reported.
 
   figma-lens map     [--design design] [--map figma-lens.map.json]
       Create/extend the component map with every component and token seen in the exports.
@@ -109,6 +111,7 @@ function printCompare(r, flags) {
   } else {
     const trend = r.previousMismatchPct != null ? c.gray(` (was ${r.previousMismatchPct}%)`) : '';
     console.log(`${c.bold(r.frame)}: ${pct(r.mismatchPct)} different from the Figma frame${trend}`);
+    if (r.text && r.text.ignoredNoisePx) console.log(c.gray(`  font rendering noise ignored (plain pixel diff: ${r.rawMismatchPct}%)`));
     if (Math.abs(r.heightDelta) >= 2) console.log(c.yellow(`  ⚠ your build is ${Math.abs(r.heightDelta)} units ${r.heightDelta > 0 ? 'taller' : 'shorter'} than the frame`));
     for (const g of r.regions.slice(0, 5)) {
       const layers = g.nodes.map((n) => `${n.id} "${n.name}"`).join(', ') || 'background/spacing';
@@ -185,6 +188,7 @@ async function main() {
         actualFile: path.resolve(flags.actual),
         cropTop: num(flags['crop-top'], 0),
         cropBottom: num(flags['crop-bottom'], 0),
+        textToleranceUnits: num(flags['text-tolerance'], 0),
         outDir: flags.out && path.resolve(flags.out),
       });
       printCompare(r, flags);
@@ -204,6 +208,7 @@ async function main() {
         actualFile: shot,
         cropTop: num(flags['crop-top'], 0),
         cropBottom: num(flags['crop-bottom'], 0),
+        textToleranceUnits: num(flags['text-tolerance'], 0),
         outDir,
       });
       printCompare(r, flags);

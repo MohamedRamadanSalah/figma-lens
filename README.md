@@ -92,6 +92,7 @@ After the fix, the next run prints `Home: 0% different (was 19.4%)`.
 
 - The viewport is set to the frame's width and scale automatically, and the whole page is captured, so a build that is taller than the frame is reported instead of cut off (`--viewport` captures only one frame-sized screen). Builds rendered at any density are resized onto the design's pixel grid.
 - `report.md` lists the biggest differing areas with the **Figma layer ids** in them, per-section scores, and whether the build is taller or shorter than the frame.
+- **Font rendering noise (experimental, off by default).** Figma, Chrome and Flutter rasterize glyphs a little differently. With `--text-tolerance 1`, a differing pixel inside a text layer is ignored when the other image has the same color within 1 design unit, both ways. In `diff.png` red is counted and amber is ignored. **Know the limits before you turn it on.** On real browser text it removes only about half of the subpixel noise, and it can hide a one-letter change ("Continue" → "Continua"). Use it as a second opinion, never as a pass/fail gate. Always on, whatever the setting: `rawMismatchPct` (the plain pixel score) and text **suspects**, text layers whose ink differs by more than 25% (wrong weight, size or color), listed in report.md.
 - Each run records its score in `compare/history.json`, so the agent can see progress.
 - `--fail-above 3` exits with code 1 when the mismatch is above 3%, for CI.
 - `figma-lens compare --design … --actual shot.png` compares an image of your build you already have.
@@ -207,8 +208,12 @@ Common flags: `--crop-top/--crop-bottom <px>` (phone status/nav bars), `--fail-a
 | Plugin option | Effect |
 |---|---|
 | Preview quality | frame preview at 1x / 2x / 3x (default 2x) |
-| Include CSS per layer | adds Figma's CSS to `spec.json` (first 800 layers) |
+| Include CSS per layer | adds Figma's CSS to `spec.json` for styled layers (fills, strokes, effects, radius, layout or text) |
 | Section crops | the bridge cuts the frame preview into the page's blocks (and splits spec.md per section for large frames) |
+| Max layers | `0` (default) = read the whole frame, however big. The plugin pauses every 200 layers so Figma stays responsive. With a limit, the layers left out are listed by id in spec.md and `meta.skipped`, so you can export them on their own. |
+| CSS limit | at most this many layers get CSS (default 3000, `0` = all). `getCSSAsync` is the slow part and CSS mostly repeats the spec, so the spec is complete either way. |
+
+**How an export travels.** The plugin hands each file (frame preview, icons, images) to its UI as soon as it exists. The UI uploads each one as raw bytes in its own request: 4 at a time, a failed file retried on its own, no base64. A last request carries only the spec. The bridge stages the files in `<out>/.figma-lens-uploads/` and builds the complete new export there. Only then does it swap it into the frame's folder: old entries are moved aside, the new ones moved in, and the `.figma-lens.json` marker replaced last. If any step fails, the old entries are moved back. A failed, rejected or abandoned export leaves the previous one as it was, and `auto/` is never touched. If moving back also fails (both renames refused, for example a file locked by another program), the old files that couldn't be restored stay in `.figma-lens-uploads/` for an hour, and the bridge reports the error. Leftovers from a stopped bridge are removed after an hour. An older bridge without this protocol still gets the old single request.
 
 | Bridge flag / env | Default |
 |---|---|

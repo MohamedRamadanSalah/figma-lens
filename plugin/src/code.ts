@@ -3,9 +3,14 @@
 // framework-neutral spec + screenshots + icons to the local bridge (bridge/server.js),
 // which writes design/<frame>/ for Claude Code to read. No REST API, no Dev Mode needed.
 
-const VERSION = '0.1.0';
-const MAX_NODES = 5000; // hard stop for huge selections
-const CSS_LIMIT = 800; // getCSSAsync is slow; only enrich this many nodes
+const VERSION = '0.2.0';
+// Both limits are set in the plugin UI; 0 means no limit. The layer limit is off by default: the walk
+// yields to Figma regularly, so big frames take longer but never freeze it or come back incomplete.
+const DEFAULT_MAX_LAYERS = 0;
+const DEFAULT_CSS_LIMIT = 3000; // getCSSAsync is the slow part; CSS mostly repeats the spec
+const CSS_CONCURRENCY = 8;
+const YIELD_EVERY = 200; // layers between pauses that let Figma repaint and handle input
+const MAX_SKIPPED_LISTED = 200;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Json = any;
@@ -14,11 +19,13 @@ interface Options {
   scale: number;
   css: boolean;
   sections: boolean;
+  maxLayers: number; // 0 = no limit
+  cssLimit: number; // 0 = no limit
 }
 
 interface OutFile {
   path: string;
-  bytes: Uint8Array;
+  size: number;
 }
 
 const SHAPE_TYPES: string[] = ['VECTOR', 'BOOLEAN_OPERATION', 'STAR', 'POLYGON', 'LINE', 'ELLIPSE', 'RECTANGLE'];
@@ -81,10 +88,13 @@ function boxOf(n: SceneNode): Box {
 }
 
 class Ctx {
-  files: OutFile[] = [];
+  files: OutFile[] = []; // paths only: the bytes go to the UI as soon as they exist (see emit)
   count = 0;
   cssCount = 0;
+  cssQueue: { n: SceneNode; s: Json }[] = [];
   truncated = false;
+  skipped: Json[] = []; // roots of subtrees left out by the layer limit
+  skippedCount = 0;
   warnings: string[] = [];
   imageByHash = new Map<string, string>();
   assetByContent = new Map<string, string>();
@@ -96,10 +106,17 @@ class Ctx {
   ox: number;
   oy: number;
 
-  constructor(public root: SceneNode, public opts: Options) {
+  constructor(public root: SceneNode, public opts: Options, public exportId: string) {
     const b = boxOf(root);
     this.ox = b.x;
     this.oy = b.y;
+  }
+
+  // Hand one file to the UI right away, in its own message. The UI uploads it as raw bytes while
+  // the walk continues, so no single message or request has to carry the whole export.
+  emit(path: string, bytes: Uint8Array): void {
+    figma.ui.postMessage({ type: 'file', exportId: this.exportId, path, bytes });
+    this.files.push({ path, size: bytes.length });
   }
 
   uniquePath(dir: string, base: string, ext: string): string {
@@ -232,7 +249,7 @@ async function imageAsset(ctx: Ctx, hash: string): Promise<string | undefined> {
     if (!img) return undefined;
     const bytes = await img.getBytesAsync();
     const path = ctx.uniquePath('images', hash.slice(0, 16), sniffExt(bytes));
-    ctx.files.push({ path, bytes });
+    ctx.emit(path, bytes);
     ctx.imageByHash.set(hash, path);
     return path;
   } catch (e) {
@@ -382,7 +399,7 @@ async function vectorAsset(ctx: Ctx, n: SceneNode, baseName: string): Promise<st
     const known = ctx.assetByContent.get(key);
     if (known) return known;
     const path = ctx.uniquePath('assets', slugify(baseName) || 'icon', 'svg');
-    ctx.files.push({ path, bytes });
+    ctx.emit(path, bytes);
     ctx.assetByContent.set(key, path);
     return path;
   } catch (e) {
@@ -533,14 +550,27 @@ async function boundVars(ctx: Ctx, n: SceneNode): Promise<Json | undefined> {
   return Object.keys(out).length ? out : undefined;
 }
 
+function pause(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 async function walk(ctx: Ctx, n: SceneNode, parent: SceneNode | null): Promise<Json | null> {
   if (!n.visible) return null;
-  if (ctx.count >= MAX_NODES) {
+  if (ctx.opts.maxLayers > 0 && ctx.count >= ctx.opts.maxLayers) {
+    // Say exactly what is missing, so it can be exported on its own instead of silently dropped.
     ctx.truncated = true;
+    ctx.skippedCount++;
+    if (ctx.skipped.length < MAX_SKIPPED_LISTED) {
+      const b = boxOf(n);
+      ctx.skipped.push({ id: n.id, name: n.name, type: n.type, box: { x: r2(b.x - ctx.ox), y: r2(b.y - ctx.oy), w: r2(n.width), h: r2(n.height) } });
+    }
     return null;
   }
   ctx.count++;
-  if (ctx.count % 150 === 0) progress('Read ' + ctx.count + ' layers…');
+  if (ctx.count % YIELD_EVERY === 0) {
+    progress('Read ' + ctx.count + ' layers…');
+    await pause();
+  }
 
   const anyN = n as Json;
   const b = boxOf(n);
@@ -664,13 +694,9 @@ async function walk(ctx: Ctx, n: SceneNode, parent: SceneNode | null): Promise<J
 
   if (n.type === 'TEXT') s.text = await textInfo(ctx, n);
 
-  if (ctx.opts.css && ctx.cssCount < CSS_LIMIT) {
-    try {
-      s.css = await n.getCSSAsync();
-      ctx.cssCount++;
-    } catch (e) {
-      // CSS is optional enrichment only
-    }
+  // CSS is fetched after the walk, only for layers where it adds something (own look, layout or text).
+  if (ctx.opts.css && (s.fills || s.stroke || s.effects || s.radius || s.layout || s.text || s.opacity || s.rotation || s.blend)) {
+    ctx.cssQueue.push({ n, s });
   }
 
   if ('children' in n) {
@@ -701,10 +727,36 @@ function pickSections(ctx: Ctx, root: SceneNode): Json[] {
   });
 }
 
-async function exportNode(node: SceneNode, opts: Options): Promise<Json> {
-  const ctx = new Ctx(node, opts);
+// getCSSAsync for the queued layers, a few at a time, up to the CSS limit (0 = all).
+async function addCss(ctx: Ctx): Promise<void> {
+  const limit = ctx.opts.cssLimit > 0 ? ctx.opts.cssLimit : ctx.cssQueue.length;
+  const todo = ctx.cssQueue.slice(0, limit);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < todo.length) {
+      const job = todo[next++];
+      try {
+        job.s.css = await job.n.getCSSAsync();
+        ctx.cssCount++;
+      } catch (e) {
+        // CSS is optional enrichment only
+      }
+      if (ctx.cssCount % YIELD_EVERY === 0) {
+        progress('CSS for ' + ctx.cssCount + ' / ' + todo.length + ' layers…');
+        await pause();
+      }
+    }
+  };
+  const workers: Promise<void>[] = [];
+  for (let i = 0; i < Math.min(CSS_CONCURRENCY, todo.length); i++) workers.push(worker());
+  await Promise.all(workers);
+}
+
+async function exportNode(node: SceneNode, opts: Options, exportId: string): Promise<Json> {
+  const ctx = new Ctx(node, opts, exportId);
   progress('Reading "' + node.name + '"…');
   const spec = await walk(ctx, node, null);
+  if (opts.css && ctx.cssQueue.length) await addCss(ctx);
 
   progress('Rendering the frame preview…');
   // useAbsoluteBounds: render exactly the node's box (default would crop to visible content
@@ -719,7 +771,7 @@ async function exportNode(node: SceneNode, opts: Options): Promise<Json> {
     png = await node.exportAsync({ format: 'PNG', useAbsoluteBounds: true, constraint: { type: 'SCALE', value: 1 } });
   }
   const screen = 'screen@' + scale + 'x.png';
-  ctx.files.push({ path: screen, bytes: png });
+  ctx.emit(screen, png);
 
   return {
     meta: {
@@ -737,6 +789,10 @@ async function exportNode(node: SceneNode, opts: Options): Promise<Json> {
       sections: opts.sections ? pickSections(ctx, node) : [],
       nodeCount: ctx.count,
       truncated: ctx.truncated,
+      maxLayers: opts.maxLayers,
+      skipped: ctx.skipped,
+      skippedCount: ctx.skippedCount,
+      css: opts.css ? { limit: opts.cssLimit, added: ctx.cssCount, candidates: ctx.cssQueue.length } : null,
       warnings: ctx.warnings,
       exportedAt: new Date().toISOString(),
     },
@@ -769,17 +825,29 @@ figma.ui.onmessage = async (msg: Json) => {
   if (!msg || msg.type !== 'export') return;
   const raw = msg.options || {};
   const scale = [1, 2, 3, 4].indexOf(Number(raw.scale)) >= 0 ? Number(raw.scale) : 2;
-  const opts: Options = { scale, css: raw.css !== false, sections: raw.sections !== false };
+  const limit = (v: unknown, d: number): number => {
+    const n = v === undefined || v === null || v === '' ? d : Math.floor(Number(v));
+    return isFinite(n) && n >= 0 ? n : d;
+  };
+  const opts: Options = {
+    scale,
+    css: raw.css !== false,
+    sections: raw.sections !== false,
+    maxLayers: limit(raw.maxLayers, DEFAULT_MAX_LAYERS),
+    cssLimit: limit(raw.cssLimit, DEFAULT_CSS_LIMIT),
+  };
   const selection = figma.currentPage.selection.slice();
   if (!selection.length) {
     figma.ui.postMessage({ type: 'error', message: 'Select at least one frame first.' });
   }
   for (const node of selection) {
+    const exportId = node.id + '@' + Date.now();
+    figma.ui.postMessage({ type: 'begin', exportId, name: node.name });
     try {
-      const payload = await exportNode(node, opts);
-      figma.ui.postMessage({ type: 'payload', payload });
+      const payload = await exportNode(node, opts, exportId);
+      figma.ui.postMessage({ type: 'payload', exportId, payload });
     } catch (e) {
-      figma.ui.postMessage({ type: 'error', message: node.name + ': ' + errMsg(e) });
+      figma.ui.postMessage({ type: 'error', exportId, message: node.name + ': ' + errMsg(e) });
     }
   }
   figma.ui.postMessage({ type: 'done-reading', count: selection.length });

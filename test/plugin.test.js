@@ -74,8 +74,8 @@ function buildScene() {
   return { root, exports };
 }
 
-async function runExport() {
-  const { root, exports } = buildScene();
+async function runExport({ scene = buildScene(), options = { scale: 2, css: true, sections: true } } = {}) {
+  const { root, exports } = scene;
   const V = {
     V1: { id: 'V1', name: 'color/primary', resolvedType: 'COLOR', variableCollectionId: 'C1',
       valuesByMode: { m1: { r: 0.36, g: 0.36, b: 0.84, a: 1 }, m2: { type: 'VARIABLE_ALIAS', id: 'V3' } }, codeSyntax: {} },
@@ -97,8 +97,8 @@ async function runExport() {
     getImageByHash: () => ({ getBytesAsync: async () => new Uint8Array([0xff, 0xd8, 0, 0]) }),
     getNodeByIdAsync: async () => ({ name: 'Icon/Arrow' }),
   };
-  vm.runInNewContext(fs.readFileSync(BUNDLE, 'utf8'), { figma, __html__: '', console, Uint8Array });
-  await figma.ui.onmessage({ type: 'export', options: { scale: 2, css: true, sections: true } });
+  vm.runInNewContext(fs.readFileSync(BUNDLE, 'utf8'), { figma, __html__: '', console, Uint8Array, setTimeout });
+  await figma.ui.onmessage({ type: 'export', options });
   return { messages, exports };
 }
 
@@ -107,8 +107,14 @@ test('bundled plugin exports a correct payload from a mocked scene', async () =>
   assert.deepEqual(messages.filter((m) => m.type === 'error'), []);
   // Objects built inside the vm have foreign prototypes; JSON round-trip them into this realm
   // (file bytes are dropped, only paths are compared).
-  const raw = messages.find((m) => m.type === 'payload').payload;
-  const p = JSON.parse(JSON.stringify({ ...raw, files: Array.from(raw.files, (f) => ({ path: f.path })) }));
+  const msg = messages.find((m) => m.type === 'payload');
+  const p = JSON.parse(JSON.stringify(msg.payload));
+  // Files are streamed one message each, before the payload, with the same export id; the payload only lists them.
+  const fileMsgs = messages.filter((m) => m.type === 'file');
+  assert.ok(fileMsgs.every((m) => m.exportId === msg.exportId && m.bytes.length > 0));
+  assert.deepEqual(fileMsgs.map((m) => m.path).sort(), p.files.map((f) => f.path).sort());
+  assert.ok(messages.indexOf(msg) > messages.indexOf(fileMsgs[fileMsgs.length - 1]));
+  assert.deepEqual(p.files.map((f) => f.size), fileMsgs.map((m) => m.bytes.length));
   const byName = (n, name) => (n.name === name ? n : (n.children || []).map((c) => byName(c, name)).find(Boolean));
 
   // screenshot covers exactly the frame box (so crops line up with spec coordinates)
@@ -143,4 +149,55 @@ test('bundled plugin exports a correct payload from a mocked scene', async () =>
   assert.match(md, /radius 8,8,0,8/);
   // per-corner radii (8,8,0,8) counted once per node — assert on the data, not a regex over the whole md
   assert.deepEqual(summarizeUsage(p.spec).radii.find((r) => r.value === 8), { value: 8, count: 1, names: [] });
+});
+
+// A flat frame with `count` styled rectangles (each one gets CSS).
+function bigScene(count) {
+  const exports = [];
+  const kids = [];
+  for (let i = 0; i < count; i++) {
+    kids.push({ id: '2:' + i, type: 'RECTANGLE', visible: true, name: 'cell ' + i, width: 10, height: 10, rotation: 0, opacity: 1,
+      blendMode: 'PASS_THROUGH', fills: [{ type: 'SOLID', visible: true, opacity: 1, blendMode: 'NORMAL', color: { r: 1, g: 0, b: 0 } }],
+      strokes: [], effects: [], boundVariables: {}, cornerRadius: 0, absoluteBoundingBox: { x: (i % 100) * 10, y: Math.floor(i / 100) * 10, width: 10, height: 10 },
+      absoluteTransform: [[1, 0, 0], [0, 1, 0]], getCSSAsync: async () => ({ background: 'red' }), exportAsync: async () => new Uint8Array([0x89, 0x50]) });
+  }
+  const root = { id: '2:root', type: 'FRAME', visible: true, name: 'Big Grid', width: 1000, height: Math.ceil(count / 100) * 10, rotation: 0, opacity: 1,
+    blendMode: 'PASS_THROUGH', fills: [], strokes: [], effects: [], boundVariables: {}, layoutMode: 'NONE', clipsContent: false, cornerRadius: 0,
+    absoluteBoundingBox: { x: 0, y: 0, width: 1000, height: Math.ceil(count / 100) * 10 }, absoluteTransform: [[1, 0, 0], [0, 1, 0]], children: kids,
+    exportAsync: async (o) => { exports.push(o); return new Uint8Array([0x89, 0x50]); } };
+  kids.forEach((k) => (k.parent = root));
+  return { root, exports };
+}
+
+test('large frames are read completely by default (no 5,000-layer or 800-CSS cap)', async () => {
+  const { messages } = await runExport({ scene: bigScene(6000) });
+  const p = messages.find((m) => m.type === 'payload').payload;
+  assert.equal(p.meta.truncated, false);
+  assert.equal(p.meta.nodeCount, 6001);
+  assert.equal(p.spec.children.length, 6000);
+  assert.equal(p.meta.css.added, 3000); // default CSS limit, spent only on styled layers
+  assert.equal(p.meta.css.candidates, 6000);
+  assert.equal(p.spec.children[2999].css.background, 'red');
+  assert.equal(p.spec.children[3000].css, undefined);
+  // progress was reported while reading (the walk yields to Figma)
+  assert.ok(messages.some((m) => m.type === 'progress' && /Read 6000 layers/.test(m.text)));
+});
+
+test('layer and CSS limits come from the UI; skipped layers are listed, not silently dropped', async () => {
+  const { messages } = await runExport({ scene: bigScene(250), options: { scale: 1, css: true, sections: false, maxLayers: 101, cssLimit: 0 } });
+  const p = JSON.parse(JSON.stringify(messages.find((m) => m.type === 'payload').payload));
+  assert.equal(p.meta.truncated, true);
+  assert.equal(p.meta.nodeCount, 101);
+  assert.equal(p.meta.skippedCount, 150);
+  assert.deepEqual(p.meta.skipped[0], { id: '2:100', name: 'cell 100', type: 'RECTANGLE', box: { x: 0, y: 10, w: 10, h: 10 } });
+  assert.equal(p.meta.css.added, 100); // cssLimit 0 = all
+  const md = renderMarkdown(p, summarizeUsage(p.spec));
+  assert.match(md, /Layer limit \(101\) reached — 150 layer subtree\(s\) are missing/);
+  assert.match(md, /`2:100` RECTANGLE "cell 100" at 0,10 10×10/);
+  assert.match(md, /… and 110 more/);
+  // nonsense limits fall back to the defaults
+  const bad = await runExport({ scene: bigScene(5), options: { scale: 1, css: true, maxLayers: -3, cssLimit: 'x' } });
+  const meta = bad.messages.find((m) => m.type === 'payload').payload.meta;
+  assert.equal(meta.maxLayers, 0);
+  assert.equal(meta.css.limit, 3000);
 });

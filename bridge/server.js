@@ -3,6 +3,8 @@
 // so Claude Code can read them. Zero config:  node bridge/server.js --out ./design
 import http from 'node:http';
 import fs from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PNG } from 'pngjs';
@@ -16,7 +18,10 @@ import { c } from '../tools/colors.js';
 const VERSION = '0.2.0';
 const MARKER = '.figma-lens.json';
 const AUTO_DIR = 'auto'; // auto-mode results inside an export folder; survives re-exports
-const MAX_BODY = 300 * 1024 * 1024;
+const MAX_BODY = 300 * 1024 * 1024; // JSON bodies (legacy single-shot export, or spec at finish)
+const MAX_FILE = 200 * 1024 * 1024; // one streamed file
+const UPLOADS_DIR = '.figma-lens-uploads'; // staging inside outRoot, so finishing is a rename on the same disk
+const UPLOAD_TTL_MS = 60 * 60 * 1000; // abandoned uploads are removed after an hour without activity
 const SAFE_FILE = /^[A-Za-z0-9][A-Za-z0-9._@-]*(\/[A-Za-z0-9][A-Za-z0-9._@-]*)*$/;
 
 export function folderSlug(name, fallback) {
@@ -175,53 +180,226 @@ function mapFor(outRoot, mapFile, warnings) {
   }
 }
 
+// Every listed path once: a repeat would mean two different files claim one name.
+function checkUnique(paths) {
+  const seen = new Set();
+  for (const p of paths) {
+    const key = String(p).toLowerCase(); // one file on Windows and macOS
+    if (seen.has(key)) throw new HttpError(400, `file listed twice: ${p}`);
+    seen.add(key);
+  }
+}
+
+function checkFilePath(p) {
+  if (typeof p !== 'string') throw new HttpError(400, 'bad file entry');
+  if (!SAFE_FILE.test(p) || p.split('/').some((seg) => seg === '..' || seg === '.')) throw new HttpError(400, `unsafe file path: ${p}`);
+  if (p === MARKER) throw new HttpError(400, `reserved file name: ${p}`);
+  // case-insensitive: Auto/ is the same folder as auto/ on Windows and macOS
+  if (p.split('/')[0].toLowerCase() === AUTO_DIR) throw new HttpError(400, `reserved folder: ${AUTO_DIR}/`);
+}
+
+// Legacy single request: { meta, spec, tokens, files: [{ path, base64 }] }. Kept for older plugin builds.
 export async function writeExport(outRoot, payload, { mapFile } = {}) {
   const { meta, spec, tokens, files } = payload || {};
   if (!meta || !spec || !Array.isArray(files)) throw new HttpError(400, 'payload needs meta, spec and files[]');
-  // Icons/images named after generic layers (container-12.svg) or hashes get names from their context.
-  const { renames } = nameAssets(spec, files.filter((f) => f && typeof f.path === 'string'));
-  if (Object.keys(renames).length) meta.assetRenames = renames;
-  if (meta.tool !== 'figma-lens') throw new HttpError(400, 'not a figma-lens payload');
-
   for (const f of files) {
-    if (!f || typeof f.path !== 'string' || typeof f.base64 !== 'string') throw new HttpError(400, 'bad file entry');
-    if (!SAFE_FILE.test(f.path) || f.path.split('/').some((seg) => seg === '..' || seg === '.')) {
-      throw new HttpError(400, `unsafe file path: ${f.path}`);
-    }
-    if (f.path === MARKER) throw new HttpError(400, `reserved file name: ${f.path}`);
-    // case-insensitive: Auto/ is the same folder as auto/ on Windows and macOS
-    if (f.path.split('/')[0].toLowerCase() === AUTO_DIR) throw new HttpError(400, `reserved folder: ${AUTO_DIR}/`);
+    if (!f || typeof f.base64 !== 'string') throw new HttpError(400, 'bad file entry');
+    checkFilePath(f.path);
   }
+  checkUnique(files.map((f) => f.path));
+  const entries = files.map((f) => ({ path: f.path, place: (full) => fs.writeFile(full, Buffer.from(f.base64, 'base64')) }));
+  return commitExport(outRoot, { meta, spec, tokens }, entries, { mapFile });
+}
+
+/**
+ * Write one export: replaces the frame's folder (except auto/) with the given files plus everything
+ * derived from the spec. files: [{ path, place(fullPath) }]; place() writes or moves the bytes there.
+ */
+async function commitExport(outRoot, { meta, spec, tokens }, files, { mapFile } = {}) {
+  if (meta.tool !== 'figma-lens') throw new HttpError(400, 'not a figma-lens payload');
+  // Icons/images named after generic layers (container-12.svg) or hashes get names from their context.
+  // nameAssets rewrites path; place() still knows where the bytes are.
+  const named = files.map((f) => ({ path: f.path, place: f.place }));
+  const { renames } = nameAssets(spec, named);
+  if (Object.keys(renames).length) meta.assetRenames = renames;
 
   const dir = await claimDir(outRoot, folderSlug(meta.nodeName, 'node-' + meta.nodeId), meta.nodeId);
-  await fs.mkdir(outRoot, { recursive: true });
-  // Replace this frame's own previous export, but keep auto/: an auto-mode run for this frame may
-  // still be working and writes its record (run.json, report.md) there.
-  for (const entry of await fs.readdir(dir).catch(() => [])) {
-    if (entry !== AUTO_DIR) await fs.rm(path.join(dir, entry), { recursive: true, force: true });
+  // Build the complete new export in a work folder first; the frame's folder is only touched once
+  // everything is written, so any failure up to here leaves the previous export as it was.
+  const work = path.join(outRoot, UPLOADS_DIR, 'build-' + randomUUID());
+  await fs.mkdir(work, { recursive: true });
+  try {
+    let screenBuf = null;
+    for (const f of named) {
+      const full = insideDir(work, f.path);
+      if (!full) throw new HttpError(400, `unsafe file path: ${f.path}`);
+      await fs.mkdir(path.dirname(full), { recursive: true });
+      await f.place(full);
+      if (f.path === meta.screen) screenBuf = await fs.readFile(full);
+    }
+
+    meta.warnings = Array.isArray(meta.warnings) ? meta.warnings : [];
+    const usage = summarizeUsage(spec);
+    const map = mapFor(outRoot, mapFile, meta.warnings);
+    await fs.writeFile(path.join(work, 'tokens.json'), JSON.stringify({ ...(tokens || {}), usage }, null, 1));
+    const derived = await writeDerived(work, { meta, spec, tokens, usage, map, screenBuf });
+    const { warnings, sections, sectionFiles: _sf, sectionPlan: _sp, skipped: _sk, ...markerMeta } = meta;
+    await fs.writeFile(path.join(work, MARKER), JSON.stringify(markerMeta, null, 1));
+
+    await swapInto(dir, work);
+    await writeIndex(outRoot);
+    return { dir, files: files.length + derived + 1 };
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
   }
+}
+
+/**
+ * Replace the contents of `dir` with the contents of `built`, keeping auto/ (an auto-mode run for
+ * this frame may still be writing its record there). Old entries are moved aside, not deleted, until
+ * every new entry is in; if a move fails, everything is moved back and the error is rethrown.
+ * The marker is replaced last (a rename over the old one), so the folder never loses its owner.
+ * `rename` is injectable for tests.
+ */
+export async function swapInto(dir, built, { rename = (a, b) => fs.rename(a, b) } = {}) {
   await fs.mkdir(dir, { recursive: true });
+  const aside = built + '-old';
+  await fs.mkdir(aside, { recursive: true });
+  const movedOut = [];
+  const movedIn = [];
+  const fresh = (await fs.readdir(built)).filter((e) => e !== AUTO_DIR);
+  fresh.sort((a, b) => (a === MARKER) - (b === MARKER)); // marker last: once it is in, nothing else can fail
+  let done = false;
+  try {
+    for (const entry of await fs.readdir(dir)) {
+      if (entry === AUTO_DIR || entry === MARKER) continue;
+      await rename(path.join(dir, entry), path.join(aside, entry));
+      movedOut.push(entry);
+    }
+    for (const entry of fresh) {
+      await rename(path.join(built, entry), path.join(dir, entry));
+      movedIn.push(entry);
+    }
+    done = true;
+  } catch (e) {
+    for (const entry of movedIn.reverse()) await fs.rm(path.join(dir, entry), { recursive: true, force: true }).catch(() => {});
+    for (const entry of movedOut.reverse()) await rename(path.join(aside, entry), path.join(dir, entry)).catch(() => {});
+    throw e;
+  } finally {
+    // On success the old entries go; after a rollback, anything that could not be moved back is kept.
+    if (done || (await fs.readdir(aside).catch(() => [])).length === 0) await fs.rm(aside, { recursive: true, force: true });
+  }
+}
 
-  let screenBuf = null;
-  for (const f of files) {
-    const full = insideDir(dir, f.path);
-    if (!full) throw new HttpError(400, `unsafe file path: ${f.path}`);
-    const buf = Buffer.from(f.base64, 'base64');
-    await fs.mkdir(path.dirname(full), { recursive: true });
-    await fs.writeFile(full, buf);
-    if (f.path === meta.screen) screenBuf = buf;
+async function moveFile(from, to) {
+  try {
+    await fs.rename(from, to);
+  } catch (e) {
+    if (e.code !== 'EXDEV') throw e;
+    await fs.copyFile(from, to);
+    await fs.rm(from, { force: true });
+  }
+}
+
+/**
+ * Streamed export (plugin 0.2+): no base64 and no giant JSON. Each file is its own raw request,
+ * written straight to a staging folder; the frame's folder is only replaced at finish, so a
+ * failed or abandoned upload never destroys the previous good export.
+ *   POST /exports                      -> { id }
+ *   POST /exports/<id>/files?path=...  raw bytes of one file
+ *   POST /exports/<id>/finish          { meta, spec, tokens, files: [path, ...] }
+ *   POST /exports/<id>/abort
+ */
+export function createUploads(outRoot, { ttlMs = UPLOAD_TTL_MS, maxFile = MAX_FILE } = {}) {
+  const stagingRoot = path.join(outRoot, UPLOADS_DIR);
+  const sessions = new Map(); // id -> { dir, files: Map(path -> bytes), touched }
+
+  async function drop(id) {
+    const s = sessions.get(id);
+    sessions.delete(id);
+    if (s) await fs.rm(s.dir, { recursive: true, force: true });
   }
 
-  meta.warnings = Array.isArray(meta.warnings) ? meta.warnings : [];
-  const usage = summarizeUsage(spec);
-  const map = mapFor(outRoot, mapFile, meta.warnings);
-  await fs.writeFile(path.join(dir, 'tokens.json'), JSON.stringify({ ...(tokens || {}), usage }, null, 1));
-  const derived = await writeDerived(dir, { meta, spec, tokens, usage, map, screenBuf });
-  const { warnings, sections, sectionFiles: _sf, sectionPlan: _sp, ...markerMeta } = meta;
-  await fs.writeFile(path.join(dir, MARKER), JSON.stringify(markerMeta, null, 1));
-  await writeIndex(outRoot);
+  async function sweep() {
+    const now = Date.now();
+    for (const [id, s] of sessions) if (now - s.touched > ttlMs) await drop(id);
+    // Leftovers from a bridge that was stopped mid-upload or mid-export. Only old ones: a fresh
+    // build-* folder belongs to an export being written right now.
+    for (const name of await fs.readdir(stagingRoot).catch(() => [])) {
+      if (sessions.has(name)) continue;
+      const st = await fs.stat(path.join(stagingRoot, name)).catch(() => null);
+      if (st && now - st.mtimeMs > ttlMs) await fs.rm(path.join(stagingRoot, name), { recursive: true, force: true });
+    }
+  }
 
-  return { dir, files: files.length + derived + 1 };
+  function get(id) {
+    const s = sessions.get(id);
+    if (!s) throw new HttpError(404, 'unknown or expired upload; export again');
+    s.touched = Date.now();
+    return s;
+  }
+
+  return {
+    stagingRoot,
+    async start() {
+      await sweep();
+      const id = randomUUID();
+      const dir = path.join(stagingRoot, id);
+      await fs.mkdir(dir, { recursive: true });
+      sessions.set(id, { dir, files: new Map(), touched: Date.now() });
+      return { id, maxFile };
+    },
+    async receive(id, filePath, req) {
+      const s = get(id);
+      checkFilePath(filePath);
+      const full = insideDir(s.dir, filePath);
+      if (!full) throw new HttpError(400, `unsafe file path: ${filePath}`);
+      await fs.mkdir(path.dirname(full), { recursive: true });
+      try {
+        const bytes = await new Promise((resolve, reject) => {
+          let size = 0;
+          const out = createWriteStream(full);
+          const fail = (e) => {
+            req.unpipe(out);
+            out.destroy();
+            reject(e);
+          };
+          req.on('data', (chunk) => {
+            size += chunk.length;
+            if (size > maxFile) fail(new HttpError(413, `${filePath} is larger than ${Math.round(maxFile / 1048576)} MB`));
+          });
+          req.on('error', fail);
+          req.on('aborted', () => fail(new HttpError(400, `upload of ${filePath} was interrupted`)));
+          out.on('error', fail);
+          out.on('finish', () => resolve(size));
+          req.pipe(out);
+        });
+        s.files.set(filePath, bytes);
+        return { path: filePath, bytes };
+      } catch (e) {
+        await fs.rm(full, { force: true });
+        throw e;
+      }
+    },
+    async finish(id, body, { mapFile } = {}) {
+      const s = get(id);
+      try {
+        const { meta, spec, tokens, files } = body || {};
+        if (!meta || !spec || !Array.isArray(files)) throw new HttpError(400, 'finish needs meta, spec and files[]');
+        for (const p of files) {
+          checkFilePath(p);
+          if (!s.files.has(p)) throw new HttpError(400, `file was not uploaded: ${p}`);
+        }
+        checkUnique(files);
+        const entries = files.map((p) => ({ path: p, place: (full) => moveFile(path.join(s.dir, p), full) }));
+        return await commitExport(outRoot, { meta, spec, tokens }, entries, { mapFile });
+      } finally {
+        await drop(id);
+      }
+    },
+    abort: drop,
+    active: () => sessions.size,
+  };
 }
 
 function readBody(req) {
@@ -256,8 +434,20 @@ export function originAllowed(origin) {
 }
 
 // onExport(dir) runs after the plugin got its answer (auto mode), so Figma never waits on it.
-export function createBridge({ outRoot, mapFile, log = console.log, onExport } = {}) {
+export function createBridge({ outRoot, mapFile, log = console.log, onExport, uploads } = {}) {
   const root = path.resolve(outRoot || 'design');
+  uploads = uploads || createUploads(root);
+  const exported = (result, nodeName) => {
+    log(`${c.green('✔')} ${c.bold(nodeName)} exported → ${result.dir} ${c.gray(`(${result.files} files)`)}`);
+  };
+  const afterExport = (result) => {
+    if (!onExport) return;
+    try {
+      onExport(result.dir);
+    } catch (e) {
+      log(`${c.red('✖ auto:')} ${e.message}`);
+    }
+  };
   return http.createServer(async (req, res) => {
     const origin = req.headers.origin;
     if (!originAllowed(origin)) {
@@ -275,11 +465,38 @@ export function createBridge({ outRoot, mapFile, log = console.log, onExport } =
       return;
     }
     try {
-      if (req.method === 'GET' && req.url === '/health') {
-        send(res, 200, { ok: true, tool: 'figma-lens', version: VERSION, outRoot: root });
+      const url = new URL(req.url, 'http://bridge');
+      if (req.method === 'GET' && url.pathname === '/health') {
+        send(res, 200, { ok: true, tool: 'figma-lens', version: VERSION, outRoot: root, upload: 1 });
         return;
       }
-      if (req.method === 'POST' && req.url === '/export') {
+      if (req.method === 'POST' && url.pathname === '/exports') {
+        send(res, 200, { ok: true, ...(await uploads.start()) });
+        return;
+      }
+      const m = /^\/exports\/([0-9a-f-]{36})\/(files|finish|abort)$/.exec(url.pathname);
+      if (req.method === 'POST' && m) {
+        const [, id, action] = m;
+        if (action === 'files') {
+          send(res, 200, { ok: true, ...(await uploads.receive(id, url.searchParams.get('path'), req)) });
+        } else if (action === 'abort') {
+          await uploads.abort(id);
+          send(res, 200, { ok: true });
+        } else {
+          let body;
+          try {
+            body = JSON.parse(await readBody(req));
+          } catch (e) {
+            throw e instanceof HttpError ? e : new HttpError(400, 'body is not valid JSON');
+          }
+          const result = await uploads.finish(id, body, { mapFile });
+          exported(result, body.meta.nodeName);
+          send(res, 200, { ok: true, ...result });
+          afterExport(result);
+        }
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/export') {
         const raw = await readBody(req);
         let payload;
         try {
@@ -288,15 +505,9 @@ export function createBridge({ outRoot, mapFile, log = console.log, onExport } =
           throw new HttpError(400, 'body is not valid JSON');
         }
         const result = await writeExport(root, payload, { mapFile });
-        log(`${c.green('✔')} ${c.bold(payload.meta.nodeName)} exported → ${result.dir} ${c.gray(`(${result.files} files)`)}`);
+        exported(result, payload.meta.nodeName);
         send(res, 200, { ok: true, ...result });
-        if (onExport) {
-          try {
-            onExport(result.dir);
-          } catch (e) {
-            log(`${c.red('✖ auto:')} ${e.message}`);
-          }
-        }
+        afterExport(result);
         return;
       }
       send(res, 404, { ok: false, error: 'not found' });
@@ -341,8 +552,9 @@ export function startBridge({ port, out, map, auto } = {}) {
   const outRoot = path.resolve(out || process.env.FIGMA_LENS_OUT || 'design');
   const mapFile = map ? path.resolve(map) : undefined;
   const onExport = auto ? autoHandler(outRoot) : undefined;
+  const uploads = createUploads(outRoot);
   // Loopback only (never the LAN). Figma may resolve "localhost" to IPv4 or IPv6, so bind both.
-  createBridge({ outRoot, mapFile, onExport })
+  createBridge({ outRoot, mapFile, onExport, uploads })
     .on('error', (e) => {
       console.error(`cannot listen on 127.0.0.1:${port}: ${e.message}`);
       process.exit(1);
@@ -356,7 +568,7 @@ export function startBridge({ port, out, map, auto } = {}) {
         console.log(`${c.green(c.bold('auto mode: ON'))} — each export is implemented by Claude Code on a figma/<frame> branch ${c.gray(`(${cfg || `no ${CONFIG_FILE} yet — run figma-lens auto --init`})`)}`);
       }
     });
-  createBridge({ outRoot, mapFile, onExport })
+  createBridge({ outRoot, mapFile, onExport, uploads })
     .on('error', () => {
       // IPv6 loopback unavailable; IPv4 is enough
     })
