@@ -706,7 +706,7 @@ async function exportNode(node: SceneNode, opts: Options): Promise<Json> {
   progress('Reading "' + node.name + '"…');
   const spec = await walk(ctx, node, null);
 
-  progress('Rendering screenshot…');
+  progress('Rendering the frame preview…');
   // useAbsoluteBounds: render exactly the node's box (default would crop to visible content
   // or grow for shadows/overflow), so screenshot pixel = spec coordinate × scale.
   let scale = opts.scale;

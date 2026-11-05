@@ -6,8 +6,45 @@ export function readPng(file) {
   return PNG.sync.read(fs.readFileSync(file));
 }
 
-export function writePng(file, img) {
-  fs.writeFileSync(file, PNG.sync.write(img));
+// fast: light compression for images that are only looked at (compare output): several times faster
+// to write on big pages, files somewhat larger. Pixels are identical either way.
+export function writePng(file, img, { fast = false } = {}) {
+  fs.writeFileSync(file, PNG.sync.write(img, fast ? { deflateLevel: 1, deflateStrategy: 3 } : undefined));
+}
+
+/**
+ * Shrink by an integer factor keeping the most saturated pixel of each block, so 1-pixel diff marks
+ * (saturated red) stay visible in a small preview instead of being averaged away. For diff images.
+ */
+export function shrinkMax(src, factor) {
+  if (factor <= 1) return src;
+  const w = Math.max(1, Math.floor(src.width / factor));
+  const h = Math.max(1, Math.floor(src.height / factor));
+  const dst = new PNG({ width: w, height: h });
+  const s = src.data;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let best = -1;
+      let bi = 0;
+      for (let dy = 0; dy < factor; dy++) {
+        const row = (y * factor + dy) * src.width;
+        for (let dx = 0; dx < factor; dx++) {
+          const i = (row + x * factor + dx) * 4;
+          const sat = Math.max(s[i], s[i + 1], s[i + 2]) - Math.min(s[i], s[i + 1], s[i + 2]);
+          if (sat > best) {
+            best = sat;
+            bi = i;
+          }
+        }
+      }
+      const o = (y * w + x) * 4;
+      dst.data[o] = s[bi];
+      dst.data[o + 1] = s[bi + 1];
+      dst.data[o + 2] = s[bi + 2];
+      dst.data[o + 3] = s[bi + 3];
+    }
+  }
+  return dst;
 }
 
 export function blank(width, height, rgba = [255, 255, 255, 255]) {

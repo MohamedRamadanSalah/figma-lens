@@ -36,6 +36,7 @@ Never guess a design from a description when an export is possible. Ask for the 
 
 ## Workflow
 
+0. **Learn the project's architecture first.** Read its `CLAUDE.md` and any architecture/contributing docs, and look at how existing screens, components, icons, images and tokens are organized. Every file you create must go where those rules (or, without rules, the existing code) put that kind of file, with the project's naming. The project's rules beat this skill's defaults. If the project has no written rules, follow the existing structure, list the placement decisions in your report, and suggest writing them down (see `docs/PROJECT-SETUP.md` in the figma-lens repo). Before saying "done", run the project's own checks (lint, tests, architecture check) named in its `CLAUDE.md`.
 1. **Read `spec.md` fully.** Note the frame size, the layout tree, the variables and styles, and the assets. If it starts with **"Large frame: the layer tree is split per section"**, follow "Large frames" below instead of reading every section file up front.
 2. **Look at the images.** Read `sections/*.png` one by one for detail. Don't open `screen@2x.png` for a tall page (it gets downscaled to mush and weighs down every later request); for a normal screen use it only for the overall picture. Values always come from the spec, never from measuring pixels.
 3. **Use the component map** (see "Component map" below). Every `⇒ USE …` in spec.md is mandatory: use that widget/component and its prop mapping, and use mapped tokens (`(color/primary ⇒ AppColors.primary)`) instead of raw values. For items marked `(not in map)`, search the codebase for the existing theme and widgets (Flutter `ThemeData`, `AppColors`, `TextTheme`, spacing constants, `lib/widgets`; web CSS variables, Tailwind config, `src/components`). Use raw values only when no token exists, and tell the user which ones you added.
@@ -162,6 +163,13 @@ Rules: fix the real code, never game the diff (no screenshots or images of the d
 | assets/x.svg | `<img src>` or inline SVG; keep the exported size |
 
 `spec.json` also has Figma's own generated CSS (`css`) for most layers. Use it to cross-check the CSS values; tokens and layout structure still come from the tree above.
+
+## Unattended runs (auto mode)
+
+When the prompt says you are running **UNATTENDED** (started by `figma-lens bridge --auto`):
+- Nobody can answer questions. Don't ask; make the most reasonable choice that fits the project's structure, and write every guess in the report.
+- Work only in the checkout the prompt names. Don't commit, push or switch branches; the user reviews the branch.
+- The report is the only thing the user reads first: say honestly what was built, the final mismatch, and what is missing. If you stop early (a blocker, the time limit), say "NOT IMPLEMENTED" and why.
 
 ## Rules
 

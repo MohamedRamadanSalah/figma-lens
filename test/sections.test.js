@@ -123,14 +123,14 @@ test('render upgrades an old export: re-crops sections, writes section specs, re
   assert.deepEqual(fs.readdirSync(path.join(dir, 'sections')).sort(), listed);
   const noShot = JSON.parse(fs.readFileSync(path.join(dir, 'spec.json'), 'utf8')).meta;
   assert.equal(noShot.sectionFiles.length, 4);
-  assert.equal(noShot.warnings.filter((w) => /^no screenshot/.test(w)).length, 1);
+  assert.equal(noShot.warnings.filter((w) => /^no frame preview/.test(w)).length, 1);
   fs.renameSync(shot + '.hold', shot);
 
   // a wrong-size screenshot: crops are skipped with ONE warning, also after re-running
   writePng(path.join(dir, 'screen@1x.png'), blank(1000, 3000));
   for (let i = 0; i < 2; i++) assert.equal(spawnSync(process.execPath, [CLI, 'render', dir], { encoding: 'utf8' }).status, 0);
   const again = JSON.parse(fs.readFileSync(path.join(dir, 'spec.json'), 'utf8')).meta;
-  assert.equal(again.warnings.filter((w) => /screenshot is 1000×3000px/.test(w)).length, 1);
+  assert.equal(again.warnings.filter((w) => /frame preview is 1000×3000px/.test(w)).length, 1);
   assert.equal(again.sectionFiles.length, 0);
   assert.ok(fs.readdirSync(path.join(dir, 'sections')).every((f) => f.endsWith('.md')));
 });

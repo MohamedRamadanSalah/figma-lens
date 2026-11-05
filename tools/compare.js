@@ -4,9 +4,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
-import { readPng, writePng, crop, resize, flatten, hstack } from './image.js';
+import { readPng, writePng, crop, resize, flatten, hstack, shrinkMax } from './image.js';
 
 const DIFF_COLOR = [255, 0, 64];
+const PANEL_MAX = 900; // px: max width of each panel in side-by-side.png
 const r1 = (n) => Math.round(n * 10) / 10;
 
 export function loadDesign(designDir) {
@@ -186,8 +187,17 @@ export function compare(opts) {
   const { meta, design, actual, diff, stats } = computeDiff(opts);
   fs.mkdirSync(outDir, { recursive: true });
   const files = { diff: path.join(outDir, 'diff.png'), sideBySide: path.join(outDir, 'side-by-side.png') };
-  writePng(files.diff, diff);
-  writePng(files.sideBySide, hstack([design, actual, diff], { bar: 8, barColors: [[91, 91, 214, 255], [31, 35, 40, 255], [255, 0, 64, 255]] }));
+  // The score above comes from the full-resolution diff. These two images are only for looking at,
+  // so they are written fast, and the side-by-side panels are kept at most PANEL_MAX wide
+  // (a full 2x page was a 7744×10090 image: ~30 s to write, and viewers shrink it anyway).
+  writePng(files.diff, diff, { fast: true });
+  const factor = Math.max(1, Math.ceil(design.width / PANEL_MAX));
+  const panels = factor > 1
+    ? [resize(design, Math.round(design.width / factor), Math.round(design.height / factor)),
+       resize(actual, Math.round(actual.width / factor), Math.round(actual.height / factor)),
+       shrinkMax(diff, factor)]
+    : [design, actual, diff];
+  writePng(files.sideBySide, hstack(panels, { bar: 8, barColors: [[91, 91, 214, 255], [31, 35, 40, 255], [255, 0, 64, 255]] }), { fast: true });
 
   const historyFile = path.join(outDir, 'history.json');
   let history = [];

@@ -23,7 +23,7 @@ export async function shotWeb({ url, width, height, scale = 2, out, fullPage = f
     }
   }
   if (!browser) {
-    throw new Error(`no Edge or Chrome found for screenshots (${String(lastErr && lastErr.message).split('\n')[0]}). Install one, or pass --channel chrome|msedge`);
+    throw new Error(`no Edge or Chrome found to render your build (${String(lastErr && lastErr.message).split('\n')[0]}). Install one, or pass --channel chrome|msedge`);
   }
   try {
     const page = await browser.newPage({ viewport: { width: Math.round(width), height: Math.round(height) }, deviceScaleFactor: scale });

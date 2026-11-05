@@ -182,7 +182,7 @@ test('screenshot that does not match frame size: warn and skip crops instead of 
     const dir = path.join(outRoot, 'login-screen');
     await assert.rejects(fs.access(path.join(dir, 'sections')));
     const md = await fs.readFile(path.join(dir, 'spec.md'), 'utf8');
-    assert.match(md, /screenshot is 800×1700px but the frame at 2x should be 780×1688px/);
+    assert.match(md, /frame preview is 800×1700px but the frame at 2x should be 780×1688px/);
   });
 });
 
