@@ -176,6 +176,47 @@ function nodeLine(n, parent) {
   return parts.join(' · ');
 }
 
+// ---------- prototype links ----------
+
+const TRIGGERS = {
+  ON_CLICK: 'on click', ON_HOVER: 'while hovering', ON_PRESS: 'while pressing', ON_DRAG: 'on drag',
+  AFTER_TIMEOUT: 'after delay', MOUSE_ENTER: 'mouse enter', MOUSE_LEAVE: 'mouse leave', MOUSE_UP: 'mouse up',
+  MOUSE_DOWN: 'mouse down', ON_KEY_DOWN: 'key down', ON_MEDIA_END: 'media end', ON_MEDIA_HIT: 'media time',
+};
+const NAVIGATIONS = { NAVIGATE: 'navigate to', SWAP: 'replace with', OVERLAY: 'open overlay', SCROLL_TO: 'scroll to', CHANGE_TO: 'change to variant' };
+
+export function triggerStr(t) {
+  if (!t) return 'on (no trigger)';
+  let s = TRIGGERS[t.type] || String(t.type).toLowerCase();
+  if (t.type === 'AFTER_TIMEOUT' && typeof t.timeout === 'number') s += ` ${t.timeout}s`;
+  if (t.delay) s += ` (delay ${t.delay}s)`;
+  if (t.keyCodes) s += ` [${t.keyCodes.join('+')}]`;
+  return s;
+}
+
+export function actionStr(a) {
+  if (a.type === 'BACK') return 'back';
+  if (a.type === 'CLOSE') return 'close overlay';
+  if (a.type === 'URL') return `open link ${a.url}${a.newTab ? ' (new tab)' : ''}`;
+  if (a.type === 'SET_VARIABLE') return `set variable ${a.variable}${a.value !== undefined ? ' = ' + JSON.stringify(a.value) : ''}`;
+  if (a.type === 'SET_VARIABLE_MODE') return `set variable mode ${a.mode} (collection ${a.collection})`;
+  if (a.type === 'CONDITIONAL') return 'if/else: ' + (a.blocks || []).map((b) => `${b.when} → ${b.actions.map(actionStr).join(', ') || 'nothing'}`).join(' | ');
+  if (a.type !== 'NODE') return String(a.type).toLowerCase();
+  let s = NAVIGATIONS[a.navigation] || String(a.navigation).toLowerCase();
+  s += a.to ? ` ${a.toName ? quote(a.toName) + ' ' : ''}(\`${a.to}\`)` : ' (no destination)';
+  const t = a.transition;
+  if (t) {
+    const ms = typeof t.duration === 'number' ? ` ${t.duration}s` : ''; // Figma reports seconds
+    s += `, ${String(t.type).toLowerCase().replace(/_/g, ' ')}${t.direction ? ' ' + t.direction.toLowerCase() : ''}${ms}${t.easing ? ' ' + t.easing.toLowerCase().replace(/_/g, '-') : ''}`;
+  }
+  if (a.preserveScroll) s += ', keep scroll position';
+  return s;
+}
+
+function reactionStr(r) {
+  return `${triggerStr(r.trigger)}: ${r.actions.map(actionStr).join(', then ')}`;
+}
+
 // cut: Map(node id → section stem). Those subtrees are written to their own file instead.
 function treeLines(n, parent, depth, out, cut = null) {
   const pad = '  '.repeat(depth);
@@ -187,6 +228,7 @@ function treeLines(n, parent, depth, out, cut = null) {
   if (n.text && n.text.segments) {
     for (const s of n.text.segments) out.push(`${pad}    - run ${quote(s.text)}: ${textStyleStr(s)}`);
   }
+  for (const r of n.reactions || []) out.push(`${pad}    - → ${reactionStr(r)}`);
   for (const c of n.children || []) treeLines(c, n, depth + 1, out, cut);
 }
 
@@ -198,6 +240,36 @@ function countNodes(n) {
 
 // Trees longer than this get one spec file per section, so the agent can read one section at a time.
 export const SPLIT_LINES = 400;
+
+// How this screen connects to the others (Figma prototype). The map of all exported screens is ../FLOWS.md.
+function prototypeLines(meta) {
+  const p = meta.prototype;
+  if (!p) return [];
+  const out = ['## Prototype (how this screen connects)'];
+  const starts = (p.flows || []).filter((f) => f.start === meta.nodeId).map((f) => quote(f.name));
+  if (starts.length) out.push(`- **Start screen** of flow ${starts.join(', ')}.`);
+  if (p.screen && p.screen.scrolls) {
+    const fixed = p.screen.fixedChildren ? `; the first ${p.screen.fixedChildren} layer(s) stay fixed while scrolling (e.g. a header)` : '';
+    out.push(`- Scrolls ${p.screen.scrolls.toLowerCase()}${fixed}.`);
+  }
+  const links = p.links || [];
+  const dest = new Map((p.destinations || []).map((d) => [d.id, d]));
+  for (const l of links.slice(0, 40)) {
+    const d = l.to && dest.get(l.to);
+    let extra = '';
+    if (d && d.overlay && l.navigation === 'OVERLAY') {
+      const o = d.overlay;
+      extra = ` (overlay: ${String(o.position).toLowerCase().replace(/_/g, ' ')}${o.background ? ', backdrop ' + o.background : ''}${o.closeOnOutsideClick ? ', closes on outside click' : ''})`;
+    }
+    const trig = triggerStr(l.trigger ? { type: l.trigger } : null);
+    out.push(`- ${quote(l.layerName)} \`${l.layer}\`: ${trig} → ${l.conditional ? '(if/else branch) ' : ''}${actionStr(l)}${extra}`);
+  }
+  if (links.length > 40) out.push(`- … ${links.length - 40} more in spec.json → meta.prototype.links`);
+  if (out.length === 1) return [];
+  if (links.length) out.push('- All exported screens and their links: `../FLOWS.md`.');
+  out.push('');
+  return out;
+}
 
 function usageLines(title, list, limit = 25) {
   if (!list.length) return [];
@@ -330,6 +402,7 @@ function renderMarkdownInner(payload, usage, map, cut = null) {
   out.push('- Text: `Family Style (weight) size/lineHeight`; lineHeight in px, % or auto; `ls` = letter spacing (px, or % of font size).');
   out.push('- `→ assets/x.svg` = this layer is an icon/vector exported as SVG; use the file, do not redraw it.');
   out.push('');
+  out.push(...prototypeLines(meta));
 
   if (meta.truncated) {
     const skipped = Array.isArray(meta.skipped) ? meta.skipped : [];

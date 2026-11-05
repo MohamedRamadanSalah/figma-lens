@@ -9,6 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PNG } from 'pngjs';
 import { renderSpecFiles, summarizeUsage } from './render-md.js';
+import { buildFlows, renderFlowsMd } from './flows.js';
 import { planSections, cropSections } from './sections.js';
 import { findMap, loadMap } from '../tools/map.js';
 import { findConfig, loadAutoConfig, createQueue, runJob, CONFIG_FILE } from '../tools/auto.js';
@@ -159,7 +160,7 @@ async function writeIndex(outRoot) {
   const lines = [
     '# Figma exports (figma-lens)',
     '',
-    'Read `<folder>/spec.md` first, then look at the frame preview and section crops.',
+    'Read `<folder>/spec.md` first, then look at the frame preview and section crops. How the screens connect: `FLOWS.md`.',
     '',
     '| Folder | Frame | Size | Figma file / page | Exported |',
     '|---|---|---|---|---|',
@@ -167,6 +168,10 @@ async function writeIndex(outRoot) {
     '',
   ];
   await fs.writeFile(path.join(outRoot, 'INDEX.md'), lines.join('\n'));
+  // The screen map, rebuilt from every export's marker (no spec.json is read).
+  const flows = buildFlows([...rows].reverse());
+  await fs.writeFile(path.join(outRoot, 'flows.json'), JSON.stringify(flows, null, 1));
+  await fs.writeFile(path.join(outRoot, 'FLOWS.md'), renderFlowsMd(flows));
 }
 
 // Map is re-read on every export so edits apply without restarting the bridge.
@@ -209,6 +214,25 @@ export async function writeExport(outRoot, payload, { mapFile } = {}) {
   checkUnique(files.map((f) => f.path));
   const entries = files.map((f) => ({ path: f.path, place: (full) => fs.writeFile(full, Buffer.from(f.base64, 'base64')) }));
   return commitExport(outRoot, { meta, spec, tokens }, entries, { mapFile });
+}
+
+/**
+ * Browser export: the files are already on disk (written one by one as they arrived, so a large frame
+ * is never held in memory). files: [{ path, file }]; each file is moved into place.
+ */
+export async function writeExportFromFiles(outRoot, { meta, spec, tokens }, files, { mapFile } = {}) {
+  if (!meta || !spec || !Array.isArray(files)) throw new HttpError(400, 'payload needs meta, spec and files[]');
+  for (const f of files) checkFilePath(f.path);
+  checkUnique(files.map((f) => f.path));
+  const entries = files.map((f) => ({ path: f.path, place: (full) => moveFile(f.file, full) }));
+  return commitExport(outRoot, { meta, spec, tokens }, entries, { mapFile });
+}
+
+/** A fresh staging folder inside outRoot (same disk, so moving files into the export is a rename). */
+export async function stagingDir(outRoot) {
+  const dir = path.join(outRoot, UPLOADS_DIR, 'browser-' + randomUUID());
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
 }
 
 /**

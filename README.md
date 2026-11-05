@@ -56,6 +56,8 @@ cp -r skill/figma-lens ~/.claude/skills/   # the Claude Code skill
 
 In the **Figma desktop app**: Plugins → Development → **Import plugin from manifest…** → choose `plugin/manifest.json`. Development plugins can't be imported in the browser.
 
+**No desktop app (Linux, or figma.com only)?** Use `figma-lens browser` instead of the plugin. It exports from figma.com in your own Chrome, Chromium or Edge, with the same output folder and the prototype links between screens. Setup, Linux notes and the `browser` config section: **[docs/BROWSER.md](docs/BROWSER.md)**. It relies on an undocumented figma.com page API; the plugin stays the fallback.
+
 Web builds are rendered with your installed **Edge or Chrome** (no browser download). Android builds are captured with **adb**.
 
 **Then, in each project you use it with:** write its `CLAUDE.md` (architecture and guidelines), its `figma-lens.map.json` and its check command. See [docs/PROJECT-SETUP.md](docs/PROJECT-SETUP.md). This is what keeps generated code inside your architecture.
@@ -68,6 +70,40 @@ Web builds are rendered with your installed **Edge or Chrome** (no browser downl
    ```
 2. In Figma, select one or more frames → Plugins → Development → **Figma Lens** → **Export to Claude**. The pill turns green when the bridge is reachable.
 3. Ask Claude: *"Implement design/login-screen in Flutter, then run the compare loop until it matches."*
+
+### From figma.com in the browser (Linux, no desktop app)
+
+Full guide: **[docs/BROWSER.md](docs/BROWSER.md)**. The short version, for each developer:
+
+**1. Browser (once).** Google Chrome, Chromium or Edge. On Ubuntu the Chrome `.deb` is the least trouble; Snap and Flatpak work too. Then check everything:
+```bash
+cd my-app
+figma-lens browser --doctor     # every line ✔, or a ✖ that says how to fix it
+```
+
+**2. Account (once).** Run `figma-lens browser`. A browser window opens on figma.com: **sign in there**, as you would anywhere (Google, email, SSO). figma-lens **never asks for or stores your password**, and there is no password setting. The login is kept in the window's own profile (`~/.figma-lens/browser-profile`), which is never in the project. For a second Figma account, use a second profile: `--profile ~/.figma-lens/other` (or `FIGMA_LENS_PROFILE`). The design file must be shared with your account (view access is enough).
+
+**3. Project (once per project, committed).** `figma-lens browser --init` adds a `browser` section to `figma-lens.config.json`. Put the output folder and the project's Figma links there by name, then commit it:
+```json
+{
+  "browser": {
+    "out": "design",
+    "files": {
+      "login": "https://www.figma.com/design/AbC123/Shop-app?node-id=12-34",
+      "home":  "https://www.figma.com/design/AbC123/Shop-app?node-id=12-80"
+    }
+  }
+}
+```
+Per-developer differences go in environment variables, not the shared file: `FIGMA_LENS_BROWSER` (browser path), `FIGMA_LENS_PROFILE`, `FIGMA_LENS_OUT`.
+
+**4. Export.**
+```bash
+figma-lens browser                       # select frames in Figma, press Enter here
+figma-lens browser login --once          # by name from "files" (or paste any Figma link)
+figma-lens browser login --flow --once   # login + every screen its prototype links lead to
+```
+The terminal shows each screen, page, step and timing. Next to `INDEX.md` you get **`FLOWS.md`**, the screen map: which screen leads to which, through which layer, and which linked screens aren't exported yet. `figma-lens parity <export A> <export B>` proves two exports carry the same data (desktop vs browser: 686/686 layers and 27/27 icons identical, 0% pixel difference on a real frame).
 
 ### Compare-and-fix loop
 
@@ -193,6 +229,8 @@ Statuses: `done` (finished and changed files), `no-changes` (finished without bu
 | Command | What it does |
 |---|---|
 | `figma-lens bridge [--out design] [--port 4141] [--map file] [--auto]` | Receives exports from the plugin; with `--auto`, Claude implements each one on a branch |
+| `figma-lens browser [link \| name] [--once] [--flow] [--auto]` | Export from figma.com in Chrome/Chromium/Edge, no desktop app ([docs/BROWSER.md](docs/BROWSER.md)); `--doctor` checks the setup, `--init` adds the config section |
+| `figma-lens parity <export A> <export B> [--json]` | Compare two exports of one frame: layers, properties, tokens, files by content, preview pixels |
 | `figma-lens auto --init` / `auto --design <dir> [--dry-run]` | Create the auto-mode config / run or preview one auto job |
 | `figma-lens check --design <dir> (--url <url> \| --adb)` | Render your build + compare it with the frame in one step |
 | `figma-lens shot --design <dir> --url <url>` / `--adb --out shot.png` | Render your build to an image only |
@@ -231,7 +269,7 @@ Common flags: `--crop-top/--crop-bottom <px>` (phone status/nav bars), `--fail-a
 
 ## What gets exported
 
-Auto layout (direction, gap, padding, alignment, wrap, grid), sizing (FIXED/HUG/FILL), absolute positions and constraints, fills (solid, gradients with angle and endpoints, images), strokes, per-corner radii, shadows and blurs, opacity and blend, text (characters, font, weight, size, line height, letter spacing, case, decoration, mixed-style runs, truncation), component and variant names and properties, bound variables with values for every mode, styles. Hidden layers are skipped. Vector-only groups become one SVG, deduplicated by content.
+Auto layout (direction, gap, padding, alignment, wrap, grid), sizing (FIXED/HUG/FILL), absolute positions and constraints, fills (solid, gradients with angle and endpoints, images), strokes, per-corner radii, shadows and blurs, opacity and blend, text (characters, font, weight, size, line height, letter spacing, case, decoration, mixed-style runs, truncation), component and variant names and properties, bound variables with values for every mode, styles. Hidden layers are skipped. Vector-only groups become one SVG, deduplicated by content. Prototype links (navigate, overlay, back, scroll-to, open link, with trigger and animation), flows and scroll settings, under each layer in spec.md, plus the screen map `FLOWS.md` / `flows.json` for the whole export folder.
 
 ## Development
 

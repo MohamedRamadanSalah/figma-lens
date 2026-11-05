@@ -10,6 +10,8 @@ import { initMap, loadMap, findMap, MAP_FILE } from '../tools/map.js';
 import { makeDemo } from '../tools/demo.js';
 import { findConfig, prepareJob, runJob, CONFIG_FILE, CONFIG_TEMPLATE } from '../tools/auto.js';
 import { nameAssets } from '../bridge/asset-names.js';
+import { resolveBrowserSettings, runBrowser, doctor, initBrowserConfig } from '../tools/browser.js';
+import { parity, parityLines } from '../tools/parity.js';
 import { c, pct } from '../tools/colors.js';
 
 const HELP = `figma-lens — let coding agents see Figma designs accurately
@@ -19,6 +21,22 @@ Usage:
       Receive exports from the Figma plugin. With --auto (and auto.enabled in ${CONFIG_FILE}),
       every export is then implemented by Claude Code, one at a time, in a git worktree on
       branch figma/<frame>. It never commits or pushes: you review the branch.
+
+  figma-lens browser [figma link | name] [--once] [--flow] [--flow-max 30] [--auto] [--out design] [--browser path] [--profile dir] [--map file] [--scale 2] [--css-limit n] [--max-layers n] [--no-css] [--config file]
+      Export from figma.com in your own Chrome/Chromium/Edge (Linux, macOS, Windows): no Figma desktop
+      app, no plugin. Opens a browser window with its own profile (sign in once); select frames in
+      Figma and press Enter, or pass a Figma link with ?node-id= or a name from browser.files (exports
+      it and exits). --flow also exports every screen the frames link to (prototype), and so on.
+      --auto hands each exported screen to Claude Code (same as bridge --auto).
+      Every export also updates design/FLOWS.md: the map of how the screens connect.
+      Settings: flags > env (FIGMA_LENS_BROWSER, FIGMA_LENS_PROFILE, FIGMA_LENS_OUT) > "browser" in
+      ${CONFIG_FILE} > auto-detect. Uses an undocumented figma.com page API; the plugin is the fallback.
+  figma-lens browser --doctor     Show the browser, profile, output folder and display it will use, and what is wrong.
+  figma-lens browser --init       Add a "browser" section to ${CONFIG_FILE} in the current folder.
+
+  figma-lens parity  <export A> <export B> [--json]
+      Compare two exports of the same frame (e.g. desktop plugin vs browser): layers, properties,
+      tokens, icons/images by content and the frame preview pixels. Exit code 1 when they differ.
 
   figma-lens auto    --init
       Write a starter ${CONFIG_FILE} in the current folder (your project root).
@@ -55,7 +73,7 @@ Usage:
 function parse(argv) {
   const flags = {};
   const pos = [];
-  const bool = new Set(['full', 'viewport', 'adb', 'json', 'help', 'auto', 'init', 'dry-run']);
+  const bool = new Set(['full', 'viewport', 'adb', 'json', 'help', 'auto', 'init', 'dry-run', 'once', 'doctor', 'no-css', 'flow']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith('--')) {
@@ -268,6 +286,31 @@ async function main() {
       console.log(`${r.frame}: ${r.beforePct}% → ${r.afterPct}% different`);
       console.log(`gif: ${r.gif}`);
       console.log(`png: ${r.png}`);
+      return;
+    }
+
+    case 'browser': {
+      if (flags.init) {
+        const r = initBrowserConfig(process.cwd());
+        console.log(r.created ? `added a "browser" section to ${r.file}; edit it, then run figma-lens browser --doctor` : `${r.file} already has a "browser" section`);
+        return;
+      }
+      const settings = resolveBrowserSettings({ flags });
+      if (flags.doctor) {
+        process.exitCode = (await doctor(settings)) ? 0 : 1;
+        return;
+      }
+      const ok = await runBrowser(settings, { url: flags.url || pos[0], once: !!flags.once, flow: !!flags.flow, auto: !!flags.auto });
+      process.exit(ok ? 0 : 1); // drop the DevTools connection; the browser window stays open
+    }
+
+    case 'parity': {
+      const [a, b] = [pos[0], pos[1]];
+      if (!a || !b) throw new Error('usage: figma-lens parity <export A> <export B>');
+      const r = parity(path.resolve(a), path.resolve(b));
+      if (flags.json) console.log(JSON.stringify(r, null, 1));
+      else for (const line of parityLines(r, c)) console.log(line);
+      if (!r.same) process.exitCode = 1;
       return;
     }
 

@@ -11,6 +11,11 @@ This study answers four questions:
 
 Every outside fact has a confidence level and a source. Anything marked **UNVERIFIED** must be tested before we build on it (see [section 8](#8-verification-checklist)).
 
+> [!NOTE]
+> **Update 2026-11-06: what was built (branch `feat/browser-export`).** A route this study didn't plan won: `figma-lens browser` starts the user's own Chrome/Chromium/Edge as a normal window and reads the frame through the `figma` object on the figma.com page, with the plugin's own code (`plugin/src/core.ts`). No publishing, no plugin import, no REST seat limits, free. Its risk: that object is **undocumented**, so the desktop plugin stays the fallback.
+> The flows export from sections 3 and 7 is built too (desktop and browser): links under each layer in spec.md, `meta.prototype.links`, and `FLOWS.md` / `flows.json` next to `INDEX.md`, plus `--flow` to export a screen and every screen it links to.
+> **Verified:** `figma-lens parity` between a desktop export and a browser export of the same 686-layer frame: every layer property identical, 27/27 icons and images identical by content, 0% pixel difference in the preview. **Not verified yet:** a real Linux machine, a Figma file with real prototype links (time units, cross-page targets). User guide: [BROWSER.md](BROWSER.md).
+
 ---
 
 ## 0. The answer in one page
