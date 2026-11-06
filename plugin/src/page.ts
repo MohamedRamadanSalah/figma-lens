@@ -24,6 +24,34 @@ function toBase64(bytes: Uint8Array): string {
   return btoa(s);
 }
 
+/** For `figma-lens project`: where the prototype starts, and every top-level screen on the page. Never throws. */
+function pageScreens(): Json {
+  const out: Json = { flows: [], frames: [] };
+  try {
+    out.flows = (figma.currentPage.flowStartingPoints || []).map((f) => ({ id: f.nodeId, name: f.name }));
+  } catch {
+    // older page API: no flows
+  }
+  try {
+    // Screens are top-level frames, also inside Sections (common in newer files). Components on the
+    // page are design-system parts, not screens. Positions are absolute: frames in a section have
+    // section-relative x/y.
+    const walk = (nodes: readonly SceneNode[]): void => {
+      for (const n of nodes) {
+        if (n.type === 'SECTION') walk(n.children);
+        else if (n.type === 'FRAME') {
+          const box = n.absoluteBoundingBox || { x: n.x, y: n.y, width: n.width, height: n.height };
+          out.frames.push({ id: n.id, name: n.name, x: Math.round(box.x), y: Math.round(box.y), w: Math.round(box.width), h: Math.round(box.height) });
+        }
+      }
+    };
+    walk(figma.currentPage.children || []);
+  } catch {
+    // page not loaded
+  }
+  return out;
+}
+
 function status(): Json {
   const g = globalThis as Json;
   if (typeof g.figma !== 'object' || !g.figma) return { ok: false, reason: 'no-figma' };
@@ -35,6 +63,7 @@ function status(): Json {
       file: figma.root.name,
       page: figma.currentPage.name,
       selection: figma.currentPage.selection.map((n) => ({ id: n.id, name: n.name, type: n.type, w: Math.round(n.width), h: Math.round(n.height) })),
+      ...pageScreens(),
     };
   } catch (e) {
     return { ok: false, reason: 'not-ready', message: errMsg(e) };

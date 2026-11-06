@@ -11,6 +11,7 @@ import { makeDemo } from '../tools/demo.js';
 import { findConfig, prepareJob, runJob, CONFIG_FILE, CONFIG_TEMPLATE } from '../tools/auto.js';
 import { nameAssets } from '../bridge/asset-names.js';
 import { resolveBrowserSettings, runBrowser, doctor, initBrowserConfig, login } from '../tools/browser.js';
+import { runProject, projectStatus } from '../tools/project.js';
 import { parity, parityLines } from '../tools/parity.js';
 import { c, pct } from '../tools/colors.js';
 
@@ -33,8 +34,17 @@ Usage:
       ${CONFIG_FILE} > auto-detect. Uses an undocumented figma.com page API; the plugin is the fallback.
   figma-lens browser --doctor     Show the browser, profile, output folder and display it will use, and what is wrong.
   figma-lens browser --init       Add a "browser" section to ${CONFIG_FILE} in the current folder.
-  figma-lens browser --login      Sign in to Figma in the figma-lens profile without the DevTools port (when Google
-      says "This browser or app may not be secure"). Close the window when done; figma-lens browser then opens signed in.
+  figma-lens browser --login      Sign in to Figma in the figma-lens profile without the DevTools port. figma-lens
+      browser and figma-lens project do this by themselves when the profile isn't signed in.
+
+  figma-lens project "<link to the first screen>" [--if-no-links this|page|stop] [browser flags]
+      Build the whole app, unattended: signs in if needed, follows the prototype from that screen,
+      then has Claude Code build every screen one after another on ONE branch figma/app-<file>
+      (later screens reuse what earlier ones added). Each finished screen that passes auto.verify
+      is committed on that branch; a screen that keeps failing is saved as a patch and skipped.
+      Run the same command again to continue: it knows what is built, what changed in Figma and
+      what is next (design/PROJECT.md). Never touches your branch, never merges, never pushes.
+  figma-lens project --status     Show design/PROJECT.md: what is built, what failed, what is next.
 
   figma-lens parity  <export A> <export B> [--json]
       Compare two exports of the same frame (e.g. desktop plugin vs browser): layers, properties,
@@ -75,7 +85,7 @@ Usage:
 function parse(argv) {
   const flags = {};
   const pos = [];
-  const bool = new Set(['full', 'viewport', 'adb', 'json', 'help', 'auto', 'init', 'dry-run', 'once', 'doctor', 'no-css', 'flow', 'login']);
+  const bool = new Set(['full', 'viewport', 'adb', 'json', 'help', 'auto', 'init', 'dry-run', 'once', 'doctor', 'no-css', 'flow', 'login', 'status']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith('--')) {
@@ -307,6 +317,18 @@ async function main() {
         return;
       }
       const ok = await runBrowser(settings, { url: flags.url || pos[0], once: !!flags.once, flow: !!flags.flow, auto: !!flags.auto });
+      process.exit(ok ? 0 : 1); // drop the DevTools connection; the browser window stays open
+    }
+
+    case 'project': {
+      const settings = resolveBrowserSettings({ flags });
+      if (flags.status) {
+        process.exitCode = projectStatus(settings.out) ? 0 : 1;
+        return;
+      }
+      const choice = flags['if-no-links'];
+      if (choice !== undefined && !['this', 'page', 'stop'].includes(choice)) throw new Error(`--if-no-links must be this, page or stop; got ${choice}`);
+      const ok = await runProject(settings, { url: flags.url || pos[0], ifNoLinks: choice });
       process.exit(ok ? 0 : 1); // drop the DevTools connection; the browser window stays open
     }
 

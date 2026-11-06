@@ -61,9 +61,9 @@ Ready. Run: figma-lens browser
 ```
 Every `✖` line says how to fix it.
 
-**4. First run:** `figma-lens browser`. A browser window opens on Figma. **Sign in** there (Google, email or SSO, as usual). This is needed only once per profile.
+**4. First run:** `figma-lens browser`. figma-lens sees that the profile isn't signed in to Figma and opens the **sign-in window** by itself: sign in there (Google, email or SSO), check that your files show, then **close that window**. figma-lens then opens its own window, signed in. Needed only once per profile.
 
-- **Google says "This browser or app may not be secure"** (seen with Arch's Chromium): close the figma-lens window, run `figma-lens browser --login`, sign in in the window it opens (it has no DevTools port), close it, then run `figma-lens browser` again: it opens signed in. Or sign in to Figma with **email** instead of Google (an account made with Google can get a password with *Forgot password?*), or use Google Chrome.
+- **Why a separate sign-in window:** Google refuses to sign in while the browser's DevTools port (which figma-lens uses to read Figma) is open: *"This browser or app may not be secure"*. This happened in Google Chrome on Windows and in Chromium on Linux. The sign-in window has no DevTools port, so Google accepts it. `figma-lens browser --login` opens the same window by hand.
 - **Figma says "WebGL isn't supported"** (WSL, virtual machines, remote desktops: no GPU the browser trusts): nothing to do. figma-lens checks WebGL when it opens the window; if it's off, it restarts the browser once with software graphics (`--ignore-gpu-blocklist`) and remembers that for the profile. You see `WebGL is off … Restarting it with software graphics` and then `✔ WebGL works now`. Exports are not affected; Figma itself just scrolls a bit slower.
 
 Run it from a terminal **inside your desktop session** (X11 or Wayland). A plain SSH session has no display; figma-lens says so. Use `ssh -X` if you must work remotely.
@@ -243,7 +243,7 @@ Measured on a real 686-layer frame (1280×4288), desktop plugin vs browser: **68
 | `did not open its DevTools port within 30s` | A window that uses the same profile is already open but was started without figma-lens. Close it and run again. |
 | `no Figma design file is open` | Open the file in the figma-lens window (not your everyday browser), select frames, press Enter. |
 | `Figma's page API … is not available` | Figma changed its page. Use the desktop plugin until figma-lens is updated. |
-| Google says "This browser or app may not be secure" | Some browser builds (Arch's Chromium, for one) are refused while the DevTools port is open. Close the figma-lens window, run `figma-lens browser --login`, sign in, close that window, run `figma-lens browser`. Or use Figma's email login, or Google Chrome. |
+| Google says "This browser or app may not be secure" | You signed in in the figma-lens window (it has the DevTools port open). Close it and run `figma-lens browser` again: it opens the sign-in window (no DevTools port) by itself. Or run `figma-lens browser --login`. |
 | Figma says "WebGL isn't supported" | figma-lens fixes this when it opens the window itself. If the window was already open, close every window of that browser (`pkill chromium` / `pkill chrome`) and run `figma-lens browser` again. If it says WebGL is off even with `--ignore-gpu-blocklist`, add `"args": ["--enable-unsafe-swiftshader"]` to the `browser` section. |
 | `--login` waits and never returns | It waits until every window of that browser profile is closed. Close them all. |
 | Snap: profile errors | Keep the default profile under `~/snap/chromium/common`. Snap can't use hidden folders in your home. |

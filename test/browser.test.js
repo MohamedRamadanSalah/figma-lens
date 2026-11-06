@@ -574,3 +574,25 @@ test('WebGL off: a window that was already open is not restarted; still off with
   assert.equal(dropped, true);
   assert.match(webglHelp(false), /WebGL isn't supported/);
 });
+
+test('page bundle status: the page\'s prototype starts and its screens, also inside Sections (absolute positions)', async () => {
+  const frame = (id, x, y, abs) => ({ type: 'FRAME', id, name: `F${id}`, x, y, width: 390, height: 844, ...(abs ? { absoluteBoundingBox: { x: abs[0], y: abs[1], width: 390, height: 844 } } : {}) });
+  const figma = {
+    editorType: 'figma',
+    root: { name: 'Shop' },
+    currentPage: {
+      name: 'Mobile',
+      selection: [],
+      flowStartingPoints: [{ nodeId: '1:1', name: 'Onboarding' }],
+      children: [
+        frame('1:1', 0, 0),
+        { type: 'SECTION', id: '9:1', name: 'Checkout', children: [frame('2:1', 10, 20, [1000, 20])] }, // x/y relative to the section
+        { type: 'COMPONENT', id: '5:1', name: 'Button', x: 0, y: 2000, width: 100, height: 40 },
+      ],
+    },
+  };
+  const status = JSON.parse(JSON.stringify((await runInPage(figma, [])).status)); // plain objects (made in the page's vm realm)
+  assert.equal(status.ok, true);
+  assert.deepEqual(status.flows, [{ id: '1:1', name: 'Onboarding' }]);
+  assert.deepEqual(status.frames.map((f) => [f.id, f.x, f.y]), [['1:1', 0, 0], ['2:1', 1000, 20]], 'section frames at their absolute position; components are not screens');
+});

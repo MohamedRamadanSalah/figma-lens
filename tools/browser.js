@@ -626,10 +626,13 @@ async function openTarget(browser, url, log) {
  * frames (the selection if the link has none). Otherwise the current selection in the Figma tab.
  * With `flow`: then every screen those frames link to (navigate / replace / overlay), and so on,
  * up to settings.flowMax screens. Returns [{ name, nodeId, dir, files, prototype } | { name?, error }].
+ * nodeIds: export exactly these frames instead (figma-lens project: "all screens on the page").
  */
-export async function exportFromBrowser(browser, settings, { url, flow = false, log = console.log, onExported } = {}) {
+export async function exportFromBrowser(browser, settings, { url, nodeIds, flow = false, log = console.log, onExported } = {}) {
   const t0 = Date.now();
-  const { target, ids, timeout } = await openTarget(browser, url, log);
+  const opened = await openTarget(browser, url, log);
+  const { target, timeout } = opened;
+  const ids = nodeIds && nodeIds.length ? nodeIds : opened.ids;
   const st = await prepare(target, timeout);
   if (st.editorType !== 'figma' && st.editorType !== 'dev') throw new Error(`this is a ${st.editorType} file; figma-lens exports Figma Design files`);
   const d = await deliveryFor(target);
@@ -755,24 +758,77 @@ export async function doctor(settings, { log = console.log, env = process.env, p
   return ok;
 }
 
-/** Start or reuse the window, then export on Enter (or once, with --once or a link). */
-export async function runBrowser(settings, { url, once = false, flow = false, auto = false, log = console.log } = {}) {
-  const first = resolveLink(url, settings); // a bad link or name fails before the browser starts
+// Figma's login cookie. Checked, not guessed: a signed-in profile has it, a signed-out one doesn't
+// (and https://www.figma.com/files sends it to /login). Reading cookies opens no tab and loads nothing.
+const AUTH_COOKIE = '__Host-figma.authn';
+
+/** Is this browser signed in to Figma? */
+export async function signedIn(browser) {
+  const cookies = await browser.contexts()[0].cookies('https://www.figma.com');
+  return cookies.some((k) => k.name === AUTH_COOKIE);
+}
+
+/**
+ * Not signed in: close the figma-lens window and open the sign-in window WITHOUT the DevTools port
+ * (Google refuses to sign in while it is open, in Chrome and Chromium), wait until it is closed, then
+ * start the figma-lens window again, signed in. Nothing to type: the developer only signs in.
+ */
+export async function ensureSignedIn(browser, { port, settings, log, connect, isSignedIn = signedIn, close = closeBrowser, signIn = login, start = ensureBrowser, webgl = ensureWebgl }) {
+  if (await isSignedIn(browser)) return { browser, port };
+  log(c.yellow('Not signed in to Figma in this browser profile yet. Opening the sign-in window (without the DevTools port, so Google accepts it).'));
+  await close(browser, port, settings.profile);
+  await signIn(settings, { log });
+  const again = await start(settings, { log });
+  let b = await connect(again.port);
+  try {
+    ({ browser: b, port } = await webgl(b, { port: again.port, started: again.started, settings, log, connect }));
+    if (!(await isSignedIn(b))) throw new Error('still not signed in to Figma. Run the same command again and sign in in the window that opens (then close it).');
+  } catch (e) {
+    await disconnect(b);
+    throw e;
+  }
+  log(`${c.green('✔')} signed in to Figma`);
+  return { browser: b, port };
+}
+
+/**
+ * The figma-lens browser, ready to export: started (or reused), WebGL working, signed in to Figma.
+ * Returns { browser, connect } (connect() reconnects to the same window).
+ */
+export async function openReady(settings, { log = console.log } = {}) {
   const pw = await import('playwright-core');
   const opened = await ensureBrowser(settings, { log });
   let port = opened.port;
   const connectTo = (p) => pw.chromium.connectOverCDP(`http://127.0.0.1:${p}`);
-  const connect = () => connectTo(port);
-  let browser = await connect();
+  let browser = await connectTo(port);
   try {
     ({ browser, port } = await ensureWebgl(browser, { port, started: opened.started, settings, log, connect: connectTo }));
+    ({ browser, port } = await ensureSignedIn(browser, { port, settings, log, connect: connectTo }));
   } catch (e) {
     await disconnect(browser); // an open DevTools connection would keep figma-lens from exiting
     throw e;
   }
-  log(opened.started
-    ? `${c.green('✔')} browser window open. First time? Sign in to Figma in that window (if Google refuses the browser, see figma-lens browser --login); the login is kept in the profile.`
-    : c.gray(`using the open figma-lens browser window (DevTools port ${port})`));
+  log(opened.started ? `${c.green('✔')} browser window open` : c.gray(`using the open figma-lens browser window (DevTools port ${port})`));
+  return { browser, connect: () => connectTo(port) };
+}
+
+/**
+ * The Figma file a link points to (opened if needed): its name and key, the link's frames, the page's
+ * prototype start points (flows) and every top-level frame on the page (frames), for figma-lens project.
+ */
+export async function fileStatus(browser, url, { log = console.log } = {}) {
+  const { target, ids, timeout } = await openTarget(browser, url, log);
+  const st = await prepare(target, timeout);
+  if (st.editorType !== 'figma' && st.editorType !== 'dev') throw new Error(`this is a ${st.editorType} file; figma-lens builds from Figma Design files`);
+  return { ...st, fileKey: fileKeyOf(target.url()), ids, flows: st.flows || [], frames: st.frames || [] };
+}
+
+/** Start or reuse the window, then export on Enter (or once, with --once or a link). */
+export async function runBrowser(settings, { url, once = false, flow = false, auto = false, log = console.log } = {}) {
+  const first = resolveLink(url, settings); // a bad link or name fails before the browser starts
+  const ready = await openReady(settings, { log });
+  let browser = ready.browser;
+  const connect = ready.connect;
   // --auto: every exported screen goes to Claude Code, one at a time (same queue and config as bridge --auto).
   const onExported = auto ? autoHandler(settings.out, log) : undefined;
   if (auto) log(`${c.green(c.bold('auto mode: ON'))} — each exported screen is implemented by Claude Code on a figma/<frame> branch`);

@@ -45,7 +45,15 @@ const DEFAULTS = {
   allowedTools: null,
   hooks: false,
   claude: null,
+  // `figma-lens project`: a screen only counts as done (and is committed) when this command passes in
+  // the worktree, e.g. "npm run verify" or "flutter analyze". Empty = Claude's own run is the check.
+  verify: '',
+  // `figma-lens project`: when a screen fails (Claude's run or verify), try again this many times with
+  // the error, then mark it "needs review" and go on to the next screen.
+  fixRetries: 2,
 };
+
+const LARGE_FRAME_MINUTES = 120;
 
 export const CONFIG_TEMPLATE = {
   auto: {
@@ -82,6 +90,8 @@ export function loadAutoConfig(file) {
   if (!(Number(auto.idleMinutes) > 0)) throw new Error(`${file}: auto.idleMinutes must be a number above 0`);
   if (!(Number.isInteger(auto.retries) && auto.retries >= 0 && auto.retries <= 5)) throw new Error(`${file}: auto.retries must be a whole number from 0 to 5`);
   if (!(Number(auto.retryDelaySeconds) >= 0)) throw new Error(`${file}: auto.retryDelaySeconds must be 0 or more`);
+  if (typeof auto.verify !== 'string') throw new Error(`${file}: auto.verify must be a command (a string), e.g. "npm run verify"`);
+  if (!(Number.isInteger(auto.fixRetries) && auto.fixRetries >= 0 && auto.fixRetries <= 5)) throw new Error(`${file}: auto.fixRetries must be a whole number from 0 to 5`);
   if (auto.allowedTools != null && !Array.isArray(auto.allowedTools)) throw new Error(`${file}: auto.allowedTools must be a list`);
   return { ...auto, file, projectDir: path.dirname(path.resolve(file)) };
 }
@@ -158,7 +168,7 @@ export function createWorktree({ top, branch, worktree }) {
   return { reused: false };
 }
 
-export function buildPrompt({ frameDir, meta, plan, mapFile, cfg, large = false, resume = false }) {
+export function buildPrompt({ frameDir, meta, plan, mapFile, cfg, large = false, resume = false, extraPrompt = '' }) {
   const fill = (s) => String(s || '').replace(/\{port\}/g, '<a free port>');
   const lines = [
     'You are running UNATTENDED (no human is watching) to implement a Figma design in this project.',
@@ -197,17 +207,19 @@ export function buildPrompt({ frameDir, meta, plan, mapFile, cfg, large = false,
       'A previous run already built this frame in this checkout (finished, not committed yet). The design was exported again: update that work to match this export (git diff shows what exists) instead of starting over.',
     );
   }
+  if (extraPrompt) lines.push('', String(extraPrompt).trim());
   if (cfg.instructions) lines.push('', 'Project instructions from figma-lens.config.json:', String(cfg.instructions));
   return lines.join('\n') + '\n';
 }
 
-export function claudeArgs({ cfg, frameDir }) {
+export function claudeArgs({ cfg, frameDir, addDirs = [] }) {
   const args = [
     '-p',
     // stream-json (needs --verbose): one JSON event per line, so the bridge can show live progress
     '--output-format', 'stream-json', '--verbose',
     '--permission-mode', 'acceptEdits',
     '--add-dir', frameDir,
+    ...addDirs.flatMap((d) => ['--add-dir', d]),
     '--allowedTools', ...(cfg.allowedTools || DEFAULT_ALLOWED_TOOLS),
     '--disallowedTools', ...DENIED_TOOLS,
   ];
@@ -344,7 +356,8 @@ export function explainFailure({ status, reason = '', timedOut = false, idle = f
   const retry = `retry (continues from the partial files): ${retryCmd}`;
   // One command per line, so each can be copied and run as is (PowerShell 5.1 has no &&).
   const [rmWorktree, rmBranch] = Array.isArray(discardCmd) ? discardCmd : [discardCmd];
-  const discard = [`or throw the partial work away: ${rmWorktree}`, ...(rmBranch ? [`then: ${rmBranch}`] : [])];
+  // No discard command in project mode: that worktree/branch holds every screen already built.
+  const discard = rmWorktree ? [`or throw the partial work away: ${rmWorktree}`, ...(rmBranch ? [`then: ${rmBranch}`] : [])] : [];
   if (status === 'no-changes') {
     return { problem: 'Claude finished without changing any file', cause: 'it stopped on purpose (a blocker, missing information); its report says why', todo: ['read the report, fix what it asks for', retry] };
   }
@@ -391,11 +404,16 @@ function writeRun(frameDir, run) {
   fs.writeFileSync(path.join(frameDir, 'auto', 'run.json'), JSON.stringify(run, null, 1));
 }
 
-/** Everything about a run except executing it (used by --dry-run and by runJob). */
-export function prepareJob({ frameDir, configFile }) {
+/**
+ * Everything about a run except executing it (used by --dry-run and by runJob).
+ * figma-lens project passes: key (one shared worktree/branch for the whole app), resume (it knows from
+ * its own state whether the work in the worktree is this screen's; the per-frame guess below doesn't),
+ * extraPrompt (the app context) and addDirs (the design folder, for FLOWS.md).
+ */
+export function prepareJob({ frameDir, configFile, key: keyOverride, resume: resumeOverride, extraPrompt = '', addDirs = [] }) {
   const cfg = loadAutoConfig(configFile);
   const { meta } = JSON.parse(fs.readFileSync(path.join(frameDir, 'spec.json'), 'utf8'));
-  const key = path.basename(frameDir); // unique per frame (the bridge's folder name), unlike the frame name
+  const key = keyOverride || path.basename(frameDir); // unique per frame (the bridge's folder name), unlike the frame name
   const plan = planWorktree({ projectDir: cfg.projectDir, key, worktreeRoot: cfg.worktreeRoot });
   const mapSrc = path.join(cfg.projectDir, 'figma-lens.map.json');
   const mapFile = fs.existsSync(mapSrc) ? path.join(frameDir, 'auto', 'figma-lens.map.json') : null;
@@ -426,22 +444,23 @@ export function prepareJob({ frameDir, configFile }) {
     }
     resume = previous === 'done' ? 'update' : 'partial';
   }
-  const promptArgs = { frameDir, meta, plan, mapFile, cfg, large };
+  if (resumeOverride !== undefined) resume = resumeOverride;
+  const promptArgs = { frameDir, meta, plan, mapFile, cfg, large, extraPrompt };
   return {
     cfg, meta, plan, mapSrc, mapFile, cmd, large, resume, promptArgs,
-    args: [...prefix, ...claudeArgs({ cfg, frameDir })],
+    args: [...prefix, ...claudeArgs({ cfg, frameDir, addDirs })],
     prompt: buildPrompt({ ...promptArgs, resume }),
   };
 }
 
 /** Run one export through Claude Code. Never throws; the outcome is in <frame>/auto/run.json. */
-export async function runJob({ frameDir, configFile, log = console.log }) {
+export async function runJob({ frameDir, configFile, log = console.log, ...overrides }) {
   frameDir = path.resolve(frameDir);
   const started = Date.now();
   const base = { frame: path.basename(frameDir), startedAt: new Date(started).toISOString() };
   let job;
   try {
-    job = prepareJob({ frameDir, configFile });
+    job = prepareJob({ frameDir, configFile, ...overrides });
     createWorktree(job.plan);
   } catch (e) {
     const run = { ...base, status: e instanceof SkipError ? 'skipped' : 'failed', reason: e.message };
@@ -460,6 +479,10 @@ export async function runJob({ frameDir, configFile, log = console.log }) {
   writeRun(frameDir, { ...meta, status: 'running' });
   log(`${c.cyan(c.bold('▶ auto:'))} implementing ${c.bold(base.frame)} on ${c.cyan(plan.branch)} ${c.gray(`(${plan.worktree})`)}`);
   log(c.gray(`  progress below; details in ${path.join(frameDir, 'auto', 'claude.jsonl')}`));
+  if (job.large && cfg.timeoutMinutes < LARGE_FRAME_MINUTES) {
+    // Seen in practice: a 686-layer frame needs over 45 min; the limit stopped a run that was still working.
+    log(c.yellow(`  ⚠ auto.timeoutMinutes is ${cfg.timeoutMinutes}: a large frame like this one often takes ${LARGE_FRAME_MINUTES}+ minutes and will be stopped while it is still working. Remove "timeoutMinutes" from figma-lens.config.json (default ${DEFAULTS.timeoutMinutes}; a frozen run is still stopped after ${cfg.idleMinutes} min without activity).`));
+  }
 
   // Attempts: the first, plus automatic retries for temporary problems (each continues the partial work).
   const deadline = started + cfg.timeoutMinutes * 60 * 1000;
@@ -490,7 +513,7 @@ export async function runJob({ frameDir, configFile, log = console.log }) {
   }
   out.stdout = allStdout;
   try {
-    return finishRun({ frameDir, cfg, plan, meta, out, started, log });
+    return finishRun({ frameDir, cfg, plan, meta, out, started, log, cmds: overrides.failureCmds });
   } catch (e) {
     // Last resort: the run already happened, so never lose its record.
     const run = { ...meta, status: 'failed', reason: `could not record the result: ${e.message}`, durationMs: Date.now() - started };
@@ -572,7 +595,7 @@ function runClaude({ job, prompt, cwd, progress, deadline, idleMs }) {
   });
 }
 
-function finishRun({ frameDir, cfg, plan, meta, out, started, log }) {
+function finishRun({ frameDir, cfg, plan, meta, out, started, log, cmds }) {
   fs.mkdirSync(path.join(frameDir, 'auto'), { recursive: true }); // a re-export may have replaced the folder meanwhile
   fs.writeFileSync(path.join(frameDir, 'auto', 'claude.jsonl'), out.stdout || ''); // every event, for debugging
   const result = out.result || null; // the final {"type":"result"} event
@@ -627,9 +650,9 @@ function finishRun({ frameDir, cfg, plan, meta, out, started, log }) {
     timeoutMinutes: cfg.timeoutMinutes,
     apiRetries: stats.apiRetries,
     imagesRead: stats.imagesRead,
-    retryCmd: `node "${CLI}" auto --design "${frameDir}"`,
-    // Two separate commands, each runnable as is from any folder.
-    discardCmd: [`git -C "${plan.top}" worktree remove --force "${plan.worktree}"`, `git -C "${plan.top}" branch -D ${plan.branch}`],
+    retryCmd: (cmds && cmds.retryCmd) || `node "${CLI}" auto --design "${frameDir}"`,
+    // Two separate commands, each runnable as is from any folder. Project mode passes discardCmd: null.
+    discardCmd: cmds && 'discardCmd' in cmds ? cmds.discardCmd : [`git -C "${plan.top}" worktree remove --force "${plan.worktree}"`, `git -C "${plan.top}" branch -D ${plan.branch}`],
   });
   run.problem = why.problem;
   run.todo = why.todo;
