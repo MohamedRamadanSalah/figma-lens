@@ -10,7 +10,7 @@ import { initMap, loadMap, findMap, MAP_FILE } from '../tools/map.js';
 import { makeDemo } from '../tools/demo.js';
 import { findConfig, prepareJob, runJob, CONFIG_FILE, CONFIG_TEMPLATE } from '../tools/auto.js';
 import { nameAssets } from '../bridge/asset-names.js';
-import { resolveBrowserSettings, runBrowser, doctor, initBrowserConfig } from '../tools/browser.js';
+import { resolveBrowserSettings, runBrowser, doctor, initBrowserConfig, login } from '../tools/browser.js';
 import { parity, parityLines } from '../tools/parity.js';
 import { c, pct } from '../tools/colors.js';
 
@@ -33,6 +33,8 @@ Usage:
       ${CONFIG_FILE} > auto-detect. Uses an undocumented figma.com page API; the plugin is the fallback.
   figma-lens browser --doctor     Show the browser, profile, output folder and display it will use, and what is wrong.
   figma-lens browser --init       Add a "browser" section to ${CONFIG_FILE} in the current folder.
+  figma-lens browser --login      Sign in to Figma in the figma-lens profile without the DevTools port (when Google
+      says "This browser or app may not be secure"). Close the window when done; figma-lens browser then opens signed in.
 
   figma-lens parity  <export A> <export B> [--json]
       Compare two exports of the same frame (e.g. desktop plugin vs browser): layers, properties,
@@ -73,7 +75,7 @@ Usage:
 function parse(argv) {
   const flags = {};
   const pos = [];
-  const bool = new Set(['full', 'viewport', 'adb', 'json', 'help', 'auto', 'init', 'dry-run', 'once', 'doctor', 'no-css', 'flow']);
+  const bool = new Set(['full', 'viewport', 'adb', 'json', 'help', 'auto', 'init', 'dry-run', 'once', 'doctor', 'no-css', 'flow', 'login']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith('--')) {
@@ -298,6 +300,10 @@ async function main() {
       const settings = resolveBrowserSettings({ flags });
       if (flags.doctor) {
         process.exitCode = (await doctor(settings)) ? 0 : 1;
+        return;
+      }
+      if (flags.login) {
+        await login(settings);
         return;
       }
       const ok = await runBrowser(settings, { url: flags.url || pos[0], once: !!flags.once, flow: !!flags.flow, auto: !!flags.auto });

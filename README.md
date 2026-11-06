@@ -82,6 +82,7 @@ figma-lens browser --doctor     # every line ✔, or a ✖ that says how to fix 
 ```
 
 **2. Account (once).** Run `figma-lens browser`. A browser window opens on figma.com: **sign in there**, as you would anywhere (Google, email, SSO). figma-lens **never asks for or stores your password**, and there is no password setting. The login is kept in the window's own profile (`~/.figma-lens/browser-profile`), which is never in the project. For a second Figma account, use a second profile: `--profile ~/.figma-lens/other` (or `FIGMA_LENS_PROFILE`). The design file must be shared with your account (view access is enough).
+If Google says *"This browser or app may not be secure"*, close the window and run `figma-lens browser --login` once (a plain window without the DevTools port), or use Figma's email login. If Figma says *"WebGL isn't supported"* (WSL, VMs), figma-lens restarts the browser with software graphics by itself.
 
 **3. Project (once per project, committed).** `figma-lens browser --init` adds a `browser` section to `figma-lens.config.json`. Put the output folder and the project's Figma links there by name, then commit it:
 ```json
@@ -229,7 +230,7 @@ Statuses: `done` (finished and changed files), `no-changes` (finished without bu
 | Command | What it does |
 |---|---|
 | `figma-lens bridge [--out design] [--port 4141] [--map file] [--auto]` | Receives exports from the plugin; with `--auto`, Claude implements each one on a branch |
-| `figma-lens browser [link \| name] [--once] [--flow] [--auto]` | Export from figma.com in Chrome/Chromium/Edge, no desktop app ([docs/BROWSER.md](docs/BROWSER.md)); `--doctor` checks the setup, `--init` adds the config section |
+| `figma-lens browser [link \| name] [--once] [--flow] [--auto]` | Export from figma.com in Chrome/Chromium/Edge, no desktop app ([docs/BROWSER.md](docs/BROWSER.md)); `--doctor` checks the setup, `--init` adds the config section, `--login` signs in without the DevTools port |
 | `figma-lens parity <export A> <export B> [--json]` | Compare two exports of one frame: layers, properties, tokens, files by content, preview pixels |
 | `figma-lens auto --init` / `auto --design <dir> [--dry-run]` | Create the auto-mode config / run or preview one auto job |
 | `figma-lens check --design <dir> (--url <url> \| --adb)` | Render your build + compare it with the frame in one step |

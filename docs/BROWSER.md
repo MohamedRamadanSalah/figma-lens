@@ -39,6 +39,7 @@ Ubuntu's `chromium-browser` is a **Snap**. It works, but Snap can't write hidden
 git clone https://github.com/MohamedRamadanSalah/figma-lens && cd figma-lens
 npm install && npm run build && npm link     # `figma-lens` is now a command
 ```
+Node from Ubuntu's own packages: 24.04 has Node 18 (fine); **22.04 has Node 12, too old**: install Node 22 first (`curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs`). With Node from apt, `npm link` needs `sudo`.
 
 **3. Check the setup.** Run this in your project folder:
 ```bash
@@ -61,6 +62,9 @@ Ready. Run: figma-lens browser
 Every `✖` line says how to fix it.
 
 **4. First run:** `figma-lens browser`. A browser window opens on Figma. **Sign in** there (Google, email or SSO, as usual). This is needed only once per profile.
+
+- **Google says "This browser or app may not be secure"** (seen with Arch's Chromium): close the figma-lens window, run `figma-lens browser --login`, sign in in the window it opens (it has no DevTools port), close it, then run `figma-lens browser` again: it opens signed in. Or sign in to Figma with **email** instead of Google (an account made with Google can get a password with *Forgot password?*), or use Google Chrome.
+- **Figma says "WebGL isn't supported"** (WSL, virtual machines, remote desktops: no GPU the browser trusts): nothing to do. figma-lens checks WebGL when it opens the window; if it's off, it restarts the browser once with software graphics (`--ignore-gpu-blocklist`) and remembers that for the profile. You see `WebGL is off … Restarting it with software graphics` and then `✔ WebGL works now`. Exports are not affected; Figma itself just scrolls a bit slower.
 
 Run it from a terminal **inside your desktop session** (X11 or Wayland). A plain SSH session has no display; figma-lens says so. Use `ssh -X` if you must work remotely.
 
@@ -163,7 +167,8 @@ One file for the whole team: **`figma-lens.config.json` in the project root**, t
     "cssLimit": 3000,
     "maxLayers": 0,
     "flowMax": 30,
-    "files": {}
+    "files": {},
+    "args": []
   }
 }
 ```
@@ -180,6 +185,7 @@ One file for the whole team: **`figma-lens.config.json` in the project root**, t
 | `sections` | `true` | Section crops (and per-section spec files for large frames). |
 | `files` | `{}` | The project's Figma links by name (see [Your project](#your-project-name-the-figma-links-once)). |
 | `flowMax` | `30` | With `--flow`: export at most this many screens in one run. `0` = no limit (each screen is still exported only once). |
+| `args` | `[]` | Extra browser flags, e.g. `["--enable-unsafe-swiftshader"]`. figma-lens sets the profile and DevTools flags itself, so those are rejected. The software-graphics flag is added by itself when needed (see WebGL above). |
 | `startUrl` | Figma recent files | The page the window opens on. |
 | `startTimeoutSeconds` | `30` | How long to wait for the browser to start. |
 
@@ -187,7 +193,7 @@ Unknown settings or wrong types stop with a clear message (`unknown setting brow
 
 **Order of priority**, highest first. `--doctor` shows which one won for each setting:
 
-1. **Command-line flags:** `--browser <path>`, `--profile <dir>`, `--out <dir>`, `--scale`, `--css-limit`, `--max-layers`, `--no-css`, `--flow-max`, `--map <file>`, `--config <file>` (and, not settings: `--once`, `--flow`, `--auto`, `--doctor`, `--init`)
+1. **Command-line flags:** `--browser <path>`, `--profile <dir>`, `--out <dir>`, `--scale`, `--css-limit`, `--max-layers`, `--no-css`, `--flow-max`, `--map <file>`, `--config <file>` (and, not settings: `--once`, `--flow`, `--auto`, `--doctor`, `--init`, `--login`)
 2. **Environment variables:** `FIGMA_LENS_BROWSER`, `FIGMA_LENS_PROFILE`, `FIGMA_LENS_OUT`, for per-developer differences such as `export FIGMA_LENS_BROWSER=/usr/bin/chromium` in `~/.bashrc`
 3. **`figma-lens.config.json`** → `browser`, in the current folder or its parent
 4. **Auto-detection.** Linux order: `google-chrome-stable`, `google-chrome`, `chromium`, `chromium-browser`, `microsoft-edge-stable`, `microsoft-edge`, Snap Chromium, then Flatpak Chrome, Chromium or Edge.
@@ -237,7 +243,9 @@ Measured on a real 686-layer frame (1280×4288), desktop plugin vs browser: **68
 | `did not open its DevTools port within 30s` | A window that uses the same profile is already open but was started without figma-lens. Close it and run again. |
 | `no Figma design file is open` | Open the file in the figma-lens window (not your everyday browser), select frames, press Enter. |
 | `Figma's page API … is not available` | Figma changed its page. Use the desktop plugin until figma-lens is updated. |
-| Google says "This browser or app may not be secure" | You're signing in in an automated window, such as one opened by another tool. Use the window `figma-lens browser` opens. |
+| Google says "This browser or app may not be secure" | Some browser builds (Arch's Chromium, for one) are refused while the DevTools port is open. Close the figma-lens window, run `figma-lens browser --login`, sign in, close that window, run `figma-lens browser`. Or use Figma's email login, or Google Chrome. |
+| Figma says "WebGL isn't supported" | figma-lens fixes this when it opens the window itself. If the window was already open, close every window of that browser (`pkill chromium` / `pkill chrome`) and run `figma-lens browser` again. If it says WebGL is off even with `--ignore-gpu-blocklist`, add `"args": ["--enable-unsafe-swiftshader"]` to the `browser` section. |
+| `--login` waits and never returns | It waits until every window of that browser profile is closed. Close them all. |
 | Snap: profile errors | Keep the default profile under `~/snap/chromium/common`. Snap can't use hidden folders in your home. |
 
 ## Security

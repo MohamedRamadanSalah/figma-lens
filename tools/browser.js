@@ -38,7 +38,16 @@ export const BROWSER_DEFAULTS = {
   startTimeoutSeconds: 30,
   flowMax: 30, // --flow stops after this many screens (0 = no limit)
   files: {}, // the project's Figma links by name: { "login": "https://www.figma.com/design/…?node-id=12-34" }
+  args: [], // extra browser flags, e.g. ["--ignore-gpu-blocklist"]
 };
+
+// Figma needs WebGL. Without a GPU the browser trusts (WSL, virtual machines, remote desktops) Chromium
+// has none, and since Chrome 137 it no longer falls back to software on its own. This flag lets it use
+// the system's software OpenGL (Mesa llvmpipe). figma-lens adds it by itself when WebGL is off and
+// remembers that in the profile (GL_MARK), so the next start needs no restart.
+export const SOFTWARE_GL = '--ignore-gpu-blocklist';
+const GL_MARK = 'figma-lens-software-gl';
+const OWN_FLAGS = ['--user-data-dir', '--remote-debugging-port', '--remote-debugging-pipe']; // figma-lens sets these
 const KEYS = Object.keys(BROWSER_DEFAULTS);
 
 export const ENV = {
@@ -68,6 +77,13 @@ export function loadBrowserConfig(file) {
   }
   for (const k of ['profile', 'out', 'startUrl']) {
     if (b[k] != null && typeof b[k] !== 'string') throw new Error(`${file}: browser.${k} must be a string`);
+  }
+  if (b.args != null) {
+    if (!Array.isArray(b.args) || !b.args.every((s) => typeof s === 'string' && s.startsWith('--'))) {
+      throw new Error(`${file}: browser.args must be a list of browser flags, like ["--ignore-gpu-blocklist"]`);
+    }
+    const own = b.args.find((s) => OWN_FLAGS.some((f) => s === f || s.startsWith(f + '=')));
+    if (own) throw new Error(`${file}: browser.args: ${own} is set by figma-lens (use "profile" for the profile folder)`);
   }
   if (b.scale != null && ![1, 2, 3, 4].includes(b.scale)) throw new Error(`${file}: browser.scale must be 1, 2, 3 or 4`);
   if (b.files != null) {
@@ -247,6 +263,7 @@ export function resolveBrowserSettings({ flags = {}, env = process.env, cwd = pr
     startUrl: pick('startUrl', undefined),
     startTimeoutSeconds: pick('startTimeoutSeconds', undefined),
     flowMax,
+    args: pick('args', undefined),
     files: conf.files || {},
     mapFile: flags.map ? path.resolve(cwd, flags.map) : undefined,
     options,
@@ -316,6 +333,140 @@ export function displayProblem(platform, env) {
   return 'no graphical display (DISPLAY and WAYLAND_DISPLAY are not set). Run figma-lens browser in a terminal inside your Linux desktop session, not a plain SSH session (or use ssh -X).';
 }
 
+/** True when this profile needs software WebGL (figma-lens found WebGL off in it before). */
+export function remembersSoftwareGl(profile) {
+  return fs.existsSync(path.join(profile, GL_MARK));
+}
+
+/** The user's browser.args, plus the software WebGL flag when the profile needs it. */
+export function extraArgs(settings) {
+  const a = [...(settings.args || [])];
+  if (remembersSoftwareGl(settings.profile) && !a.includes(SOFTWARE_GL)) a.push(SOFTWARE_GL);
+  return a;
+}
+
+/** The browser's command-line arguments (after the executable). debug: false = no DevTools port (--login). */
+export function launchArgs(settings, { debug = true, url } = {}) {
+  return [
+    ...settings.cmd.slice(1),
+    `--user-data-dir=${settings.profile}`,
+    ...(debug ? ['--remote-debugging-port=0'] : []), // the browser picks a free port on 127.0.0.1 and writes it to DevToolsActivePort
+    '--no-first-run',
+    '--no-default-browser-check',
+    ...extraArgs(settings),
+    url || settings.startUrl,
+  ];
+}
+
+/** The profile is in use while the browser's lock exists (Linux/macOS: a symlink; Windows: a locked file). */
+function profileLocked(profile) {
+  for (const f of ['SingletonLock', 'lockfile']) {
+    try {
+      fs.lstatSync(path.join(profile, f)); // lstat: SingletonLock is a symlink to "<host>-<pid>", not a file
+      if (f === 'SingletonLock') {
+        const pid = Number(/-(\d+)$/.exec(fs.readlinkSync(path.join(profile, f)))?.[1]);
+        if (!pid) return true;
+        try {
+          process.kill(pid, 0); // signal 0: only checks that the process exists
+          return true;
+        } catch (e) {
+          return e.code === 'EPERM'; // ESRCH: a crashed browser left the lock behind
+        }
+      }
+      fs.rmSync(path.join(profile, f)); // Windows: only removable once the browser let it go
+    } catch (e) {
+      if (f === 'lockfile' && e.code !== 'ENOENT') return true;
+    }
+  }
+  return false;
+}
+
+/** Close the whole figma-lens browser (every window of this profile) and wait until it has exited. */
+async function closeBrowser(browser, port, profile, timeoutMs = 20000) {
+  try {
+    const s = await browser.newBrowserCDPSession();
+    await s.send('Browser.close').catch(() => undefined); // the connection drops while it answers
+  } catch {
+    // already closing
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await alive(port)) && !profileLocked(profile)) return;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  throw new Error(`the browser did not close within ${timeoutMs / 1000}s; close it by hand and run again`);
+}
+
+/** Does this browser draw WebGL? (Figma shows "WebGL isn't supported" without it.) Checked in a blank tab. */
+async function webglWorks(browser) {
+  const page = await browser.contexts()[0].newPage();
+  try {
+    return await page.evaluate(() => {
+      const cv = document.createElement('canvas');
+      return !!(cv.getContext('webgl2') || cv.getContext('webgl'));
+    });
+  } finally {
+    await page.close().catch(() => undefined);
+  }
+}
+
+/** What to do when WebGL is off. triedSoftware: the software flag was already on. */
+export function webglHelp(triedSoftware) {
+  return triedSoftware
+    ? `WebGL is off even with ${SOFTWARE_GL}, so Figma can't open files. Add "--enable-unsafe-swiftshader" to "args" in the ` +
+        '"browser" section of figma-lens.config.json (another software renderer), or use Google Chrome. Then close every window of ' +
+        'this browser and run figma-lens browser again.'
+    : 'WebGL is off in the open figma-lens browser window, so Figma can\'t open files ("WebGL isn\'t supported"). ' +
+        'Close every window of this browser (Linux: pkill chromium, or pkill chrome) and run figma-lens browser again: ' +
+        `figma-lens then restarts it with software graphics (${SOFTWARE_GL}) by itself.`;
+}
+
+/**
+ * Make sure Figma can draw in the browser. When figma-lens started it and WebGL is off, it restarts it
+ * once with SOFTWARE_GL and remembers that for the profile. Returns the browser to use (and its port).
+ */
+export async function ensureWebgl(browser, { port, started, settings, log, connect, start = ensureBrowser, works = webglWorks, close = closeBrowser }) {
+  if (await works(browser)) return { browser, port };
+  const tried = launchArgs(settings).includes(SOFTWARE_GL); // also when it's in an "executable" list
+  if (!started || tried) throw new Error(webglHelp(tried));
+  log(c.yellow(`WebGL is off in this browser (usual in WSL, virtual machines and remote desktops without a GPU), so Figma can't open files. Restarting it with software graphics (${SOFTWARE_GL}); remembered for this profile.`));
+  await close(browser, port, settings.profile);
+  fs.writeFileSync(path.join(settings.profile, GL_MARK), `${SOFTWARE_GL}\nWritten by figma-lens: WebGL was off in this browser. Delete this file to start without the flag.\n`);
+  const again = await start(settings, { log });
+  const b = await connect(again.port);
+  if (!(await works(b))) {
+    await disconnect(b);
+    throw new Error(webglHelp(true));
+  }
+  log(`${c.green('✔')} WebGL works now (software graphics)`);
+  return { browser: b, port: again.port };
+}
+
+/**
+ * --login: open the browser with the figma-lens profile but WITHOUT the DevTools port, at the Figma
+ * login page, and wait until it is closed. For sign-ins (Google) that refuse a browser with a DevTools
+ * port open; the login is kept in the profile, so figma-lens browser opens signed in afterwards.
+ */
+export async function login(settings, { log = console.log, env = process.env, platform = process.platform } = {}) {
+  const known = readDevToolsPort(settings.profile);
+  if (known && (await alive(known))) throw new Error('the figma-lens browser window is open: close every window of it first, then run figma-lens browser --login again');
+  const problem = displayProblem(platform, env);
+  if (problem) throw new Error(problem);
+  fs.mkdirSync(settings.profile, { recursive: true });
+  log(c.gray(`starting ${settings.label} with profile ${settings.profile} (no DevTools port)`));
+  log(`Sign in to Figma in the window, check that your files show, then ${c.bold('close the window')}.`);
+  const t0 = Date.now();
+  const child = spawn(settings.cmd[0], launchArgs(settings, { debug: false, url: 'https://www.figma.com/login' }), { stdio: 'ignore' });
+  await new Promise((resolve, reject) => {
+    child.on('error', (e) => reject(new Error(`could not start ${settings.label}: ${e.message}`)));
+    child.on('exit', resolve);
+  });
+  // Some launchers hand the window to another process and return at once: then wait for the profile lock.
+  if (Date.now() - t0 < 5000) log(c.gray('waiting for the browser window to close…'));
+  while (profileLocked(settings.profile)) await new Promise((r) => setTimeout(r, 500));
+  log(`${c.green('✔')} browser closed. Now run ${c.bold('figma-lens browser')}: it opens signed in.`);
+}
+
 /** Use the figma-lens browser window if it is already open, otherwise start it. Returns the DevTools port. */
 export async function ensureBrowser(settings, { log = console.log, env = process.env, platform = process.platform } = {}) {
   const known = readDevToolsPort(settings.profile);
@@ -325,15 +476,9 @@ export async function ensureBrowser(settings, { log = console.log, env = process
   if (problem) throw new Error(problem);
   fs.mkdirSync(settings.profile, { recursive: true });
   fs.rmSync(path.join(settings.profile, 'DevToolsActivePort'), { force: true }); // left by a closed window
-  const args = [
-    ...settings.cmd.slice(1),
-    `--user-data-dir=${settings.profile}`,
-    '--remote-debugging-port=0', // the browser picks a free port on 127.0.0.1 and writes it to DevToolsActivePort
-    '--no-first-run',
-    '--no-default-browser-check',
-    settings.startUrl,
-  ];
-  log(c.gray(`starting ${settings.label} with profile ${settings.profile}`));
+  const args = launchArgs(settings);
+  const extra = extraArgs(settings);
+  log(c.gray(`starting ${settings.label} with profile ${settings.profile}${extra.length ? ` and ${extra.join(' ')}` : ''}`));
   const child = spawn(settings.cmd[0], args, { detached: true, stdio: 'ignore' });
   let spawnError = null;
   child.on('error', (e) => (spawnError = e));
@@ -595,6 +740,8 @@ export async function doctor(settings, { log = console.log, env = process.env, p
   }
   line(writable, 'profile', `${settings.profile} (from ${settings.from.profile})`,
     settings.kind === 'snap' ? 'Snap Chromium can only write some folders; keep the default under ~/snap/chromium/common' : 'pick a folder you can write to');
+  const extra = extraArgs(settings);
+  line(true, 'args', extra.length ? extra.join(' ') + (remembersSoftwareGl(settings.profile) ? ` (${SOFTWARE_GL}: WebGL was off in this browser, remembered in the profile)` : '') : 'none');
   line(true, 'out', `${settings.out} (from ${settings.from.out})`);
   const names = Object.keys(settings.files || {});
   line(true, 'files', names.length ? `${names.length} named link(s): ${names.join(', ')}` : 'none (optional: name the project\'s Figma links in browser.files)');
@@ -612,11 +759,19 @@ export async function doctor(settings, { log = console.log, env = process.env, p
 export async function runBrowser(settings, { url, once = false, flow = false, auto = false, log = console.log } = {}) {
   const first = resolveLink(url, settings); // a bad link or name fails before the browser starts
   const pw = await import('playwright-core');
-  const { port, started } = await ensureBrowser(settings, { log });
-  const connect = () => pw.chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+  const opened = await ensureBrowser(settings, { log });
+  let port = opened.port;
+  const connectTo = (p) => pw.chromium.connectOverCDP(`http://127.0.0.1:${p}`);
+  const connect = () => connectTo(port);
   let browser = await connect();
-  log(started
-    ? `${c.green('✔')} browser window open. First time? Sign in to Figma in that window; the login is kept in the profile.`
+  try {
+    ({ browser, port } = await ensureWebgl(browser, { port, started: opened.started, settings, log, connect: connectTo }));
+  } catch (e) {
+    await disconnect(browser); // an open DevTools connection would keep figma-lens from exiting
+    throw e;
+  }
+  log(opened.started
+    ? `${c.green('✔')} browser window open. First time? Sign in to Figma in that window (if Google refuses the browser, see figma-lens browser --login); the login is kept in the profile.`
     : c.gray(`using the open figma-lens browser window (DevTools port ${port})`));
   // --auto: every exported screen goes to Claude Code, one at a time (same queue and config as bridge --auto).
   const onExported = auto ? autoHandler(settings.out, log) : undefined;
@@ -689,6 +844,7 @@ export const BROWSER_CONFIG_TEMPLATE = {
   maxLayers: 0,
   flowMax: 30,
   files: {},
+  args: [],
 };
 
 /** Add a "browser" section to figma-lens.config.json in dir (created if missing); keeps everything else. */

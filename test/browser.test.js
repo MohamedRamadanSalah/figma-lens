@@ -12,6 +12,7 @@ import { writeExport, writeExportFromFiles, stagingDir } from '../bridge/server.
 import {
   resolveBrowserSettings, browserCandidates, defaultProfile, parseFigmaUrl, readDevToolsPort,
   loadBrowserConfig, initBrowserConfig, displayProblem, kindOf, resolveLink,
+  launchArgs, extraArgs, ensureWebgl, webglHelp, remembersSoftwareGl, SOFTWARE_GL,
 } from '../tools/browser.js';
 import { screenTargets, buildFlows, renderFlowsMd } from '../bridge/flows.js';
 import { parity } from '../tools/parity.js';
@@ -498,4 +499,78 @@ test('FLOWS.md: a | in a designer name does not break the tables', () => {
   }
   assert.ok(md.includes('A \\| B'), 'screen name escaped');
   assert.ok(md.includes('"Yes \\| No"'), 'layer name escaped');
+});
+
+// ---------- browser flags, WebGL and --login ----------
+
+test('browser.args: extra flags are passed to the browser; bad lists and figma-lens\'s own flags are rejected', () => {
+  const dir = tmp();
+  const f = path.join(dir, 'figma-lens.config.json');
+  const base = { cwd: dir, env: {}, platform: 'linux', home: '/h', detect: fakeChrome };
+  fs.writeFileSync(f, JSON.stringify({ browser: { args: '--ignore-gpu-blocklist' } }));
+  assert.throws(() => loadBrowserConfig(f), /browser\.args must be a list of browser flags/);
+  fs.writeFileSync(f, JSON.stringify({ browser: { args: ['ignore-gpu-blocklist'] } }));
+  assert.throws(() => loadBrowserConfig(f), /browser\.args must be a list/);
+  fs.writeFileSync(f, JSON.stringify({ browser: { args: ['--remote-debugging-port=9222'] } }));
+  assert.throws(() => loadBrowserConfig(f), /--remote-debugging-port=9222 is set by figma-lens/);
+  fs.writeFileSync(f, JSON.stringify({ browser: { args: ['--user-data-dir=/x'] } }));
+  assert.throws(() => loadBrowserConfig(f), /is set by figma-lens/);
+
+  fs.writeFileSync(f, JSON.stringify({ browser: { args: ['--lang=en'], profile: path.join(dir, 'p') } }));
+  const s = resolveBrowserSettings(base);
+  assert.deepEqual(s.args, ['--lang=en']);
+  const a = launchArgs(s);
+  assert.deepEqual(a.slice(-2), ['--lang=en', s.startUrl]);
+  assert.ok(a.includes('--remote-debugging-port=0'));
+  assert.ok(a.includes(`--user-data-dir=${s.profile}`));
+  const plain = launchArgs(s, { debug: false, url: 'https://www.figma.com/login' });
+  assert.ok(!plain.some((x) => x.startsWith('--remote-debugging')), '--login opens no DevTools port');
+  assert.equal(plain.at(-1), 'https://www.figma.com/login');
+  assert.deepEqual(resolveBrowserSettings({ ...base, cwd: tmp() }).args, []);
+});
+
+/** A fake connected browser: works() answers from `gl`. */
+const fakeBrowser = (gl) => ({ gl, closed: false });
+
+test('WebGL off in a window figma-lens just started: restart once with software graphics, remembered in the profile', async () => {
+  const profile = tmp();
+  const settings = { profile, args: [], cmd: ['/usr/bin/chromium'], startUrl: 'https://www.figma.com/' };
+  const calls = [];
+  const logs = [];
+  const r = await ensureWebgl(fakeBrowser(false), {
+    port: 1111, started: true, settings, log: (s) => logs.push(s),
+    works: async (b) => b.gl,
+    close: async (b, port, prof) => calls.push(['close', port, prof]),
+    start: async (s2) => (calls.push(['start', launchArgs(s2).includes(SOFTWARE_GL)]), { port: 2222, started: true }),
+    connect: async (port) => (calls.push(['connect', port]), fakeBrowser(true)),
+  });
+  assert.deepEqual(calls, [['close', 1111, profile], ['start', true], ['connect', 2222]]);
+  assert.equal(r.port, 2222);
+  assert.equal(r.browser.gl, true);
+  assert.equal(remembersSoftwareGl(profile), true);
+  assert.deepEqual(extraArgs(settings), [SOFTWARE_GL]);
+  assert.match(logs.join('\n'), /WebGL is off[\s\S]*WebGL works now/);
+  // next start: the flag is there from the beginning, nothing to restart
+  const ok = await ensureWebgl(fakeBrowser(true), { port: 3, started: true, settings, log: () => {}, works: async (b) => b.gl, connect: assert.fail, close: assert.fail, start: assert.fail });
+  assert.equal(ok.port, 3);
+});
+
+test('WebGL off: a window that was already open is not restarted; still off with the flag gives the next step', async () => {
+  const settings = { profile: tmp(), args: [], cmd: ['/usr/bin/chromium'] };
+  const never = { works: async () => false, close: assert.fail, start: assert.fail, connect: assert.fail, log: () => {} };
+  await assert.rejects(ensureWebgl({}, { ...never, port: 1, started: false, settings }), /Close every window of this browser \(Linux: pkill chromium[\s\S]*restarts it with software graphics/);
+  // the flag set by hand and still no WebGL: no restart loop, point to SwiftShader / Chrome
+  const withFlag = { ...settings, args: [SOFTWARE_GL] };
+  await assert.rejects(ensureWebgl({}, { ...never, port: 1, started: true, settings: withFlag }), /even with --ignore-gpu-blocklist[\s\S]*--enable-unsafe-swiftshader/);
+  const inExecutable = { ...settings, cmd: ['/usr/bin/chromium', SOFTWARE_GL] };
+  await assert.rejects(ensureWebgl({}, { ...never, port: 1, started: true, settings: inExecutable }), /even with --ignore-gpu-blocklist/);
+  // restarted, still off: the connection is dropped (figma-lens must be able to exit) and the next step shown
+  let dropped = false;
+  const b2 = { close: async () => (dropped = true) };
+  await assert.rejects(ensureWebgl({}, {
+    port: 1, started: true, settings: { ...settings, profile: tmp() }, log: () => {},
+    works: async () => false, close: async () => {}, start: async () => ({ port: 2 }), connect: async () => b2,
+  }), /--enable-unsafe-swiftshader/);
+  assert.equal(dropped, true);
+  assert.match(webglHelp(false), /WebGL isn't supported/);
 });
