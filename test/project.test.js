@@ -7,10 +7,10 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
   slug, screenKey, specHash, builtFromLog, planScreens, canvasOrder, projectPrompt, renderProjectMd,
-  assertWorktree, buildApp, collectScreens,
+  assertWorktree, buildApp, collectScreens, projectSettings,
 } from '../tools/project.js';
 import { loadAutoConfig } from '../tools/auto.js';
-import { ensureSignedIn } from '../tools/browser.js';
+import { ensureSignedIn, resolveBrowserSettings } from '../tools/browser.js';
 
 // No global git config from the machine running the tests (signing, hooks, identity).
 const EMPTY_GIT_CONFIG = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'fl-gitcfg-')), 'gitconfig');
@@ -106,6 +106,45 @@ test('what is built comes from commit trailers; status: done, changed, needs-rev
   assert.deepEqual(planScreens(screens, built, prev).map((s) => [s.name, s.status, s.commit]), [
     ['Login', 'todo', null], ['Home', 'done', 'bbbbbbbbb'], ['Cart', 'changed', 'aaaaaaaaa'], ['Pay', 'needs-review', null],
   ]);
+});
+
+test('a squash merge (all screens in one commit, indented) still counts every screen as built', () => {
+  const squash = [
+    'eeeeeeeeeeee\x1fSquashed commit of the following:',
+    '',
+    'commit 222',
+    'Author: a <a@b>',
+    '',
+    '    figma: Home',
+    '',
+    '    Figma-Node: K#2:1',
+    '    Figma-Spec: s2',
+    '',
+    'commit 111',
+    '',
+    '    figma: Login',
+    '',
+    '    Figma-Node: K#1:1',
+    '    Figma-Spec: s1',
+    '\x1e',
+  ].join('\n');
+  const pr = 'ffffffffffff\x1fShop app (#12)\n\n* figma: Cart\n\nFigma-Node: K#3:1\nFigma-Spec: s3\n\n* figma: Pay\n\nFigma-Node: K#4:1\n\x1e'; // a GitHub squash; Pay without a spec line
+  assert.deepEqual([...builtFromLog(squash + '\n' + pr)], [
+    ['K#2:1', { commit: 'eeeeeeeee', spec: 's2' }],
+    ['K#1:1', { commit: 'eeeeeeeee', spec: 's1' }],
+    ['K#3:1', { commit: 'fffffffff', spec: 's3' }],
+    ['K#4:1', { commit: 'fffffffff', spec: null }], // never borrows the next screen's spec
+  ]);
+});
+
+test('project mode follows the whole prototype: no 30-screen limit unless one was set', () => {
+  const dir = tmp();
+  const base = { cwd: dir, env: {}, platform: 'linux', home: '/h', detect: () => [{ cmd: ['/usr/bin/google-chrome'], kind: 'regular', label: 'chrome' }] };
+  assert.equal(resolveBrowserSettings(base).flowMax, 30, '--flow keeps its default');
+  assert.equal(projectSettings(resolveBrowserSettings(base)).flowMax, 0);
+  assert.equal(projectSettings(resolveBrowserSettings({ ...base, flags: { 'flow-max': '5' } })).flowMax, 5);
+  fs.writeFileSync(path.join(dir, 'figma-lens.config.json'), JSON.stringify({ browser: { flowMax: 12 } }));
+  assert.equal(projectSettings(resolveBrowserSettings(base)).flowMax, 12);
 });
 
 test('canvas order: rows top to bottom, each row left to right (rows need not align exactly)', () => {
@@ -215,6 +254,20 @@ test('a problem retries cannot fix (usage limit) stops the run; the next run con
   const again = fakeClaude(p.worktree);
   await buildApp({ screens, file: 'Shop', fileKey: 'KEY', cfg: p.cfg, configFile: p.configFile, out: p.out, command: 'c', log: quiet, runScreen: again.run, verify: ok });
   assert.deepEqual(again.calls.map((c) => [c.name, c.resume]), [['home', 'partial'], ['cart', null]]);
+});
+
+test('squash-merged into main, app branch deleted: the next run still knows every screen is built', async () => {
+  const p = project();
+  const screens = [p.screen('Login', '1:1'), p.screen('Home', '2:1')];
+  await buildApp({ screens, file: 'Shop', fileKey: 'KEY', cfg: p.cfg, configFile: p.configFile, out: p.out, command: 'c', log: quiet, runScreen: fakeClaude(p.worktree).run, verify: ok });
+  git(p.repo, 'merge', '-q', '--squash', 'figma/app-shop');
+  git(p.repo, 'commit', '-q', '--no-edit');
+  git(p.repo, 'worktree', 'remove', '--force', p.worktree);
+  git(p.repo, 'branch', '-D', 'figma/app-shop');
+  const again = fakeClaude(p.worktree);
+  const r = await buildApp({ screens, file: 'Shop', fileKey: 'KEY', cfg: p.cfg, configFile: p.configFile, out: p.out, command: 'c', log: quiet, runScreen: again.run, verify: ok });
+  assert.equal(again.calls.length, 0, 'nothing rebuilt');
+  assert.deepEqual(r.state.screens.map((s) => s.status), ['done', 'done']);
 });
 
 test('changes in the worktree that figma-lens did not make stop the run (never thrown away)', async () => {

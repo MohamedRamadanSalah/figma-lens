@@ -88,7 +88,8 @@ Keep:   in D:\my-app: git merge figma/app-shop
 
 - **The prototype decides.** figma-lens exports the screen in your link, then every screen its
   prototype links lead to (navigate, swap, open overlay), and so on. That is the app. The order is the
-  order a user meets them: the first screen first.
+  order a user meets them: the first screen first. There is no screen limit (`--flow`'s default of 30
+  doesn't apply here); to set one anyway, use `--flow-max 40` or `flowMax` in the `browser` section.
 - **A link without `?node-id=`:** the page's prototype start (Figma's *flow starting point*) is used.
 - **No prototype links** (the designer didn't wire the screens): figma-lens says so and asks:
   ```
@@ -135,7 +136,9 @@ That is the memory. On the next run figma-lens exports the screens again and com
 | ✖ needs review | Failed every try last time | Tries it again |
 | ◐ changed in Figma | Committed, but the designer changed it since | Lists it (not rebuilt automatically) |
 
-It still works after you merged the branch into `main` (it reads the trailers from both).
+It still works after you merged the branch into `main`, also with a **squash merge** or a squashed
+pull request (it reads every screen's lines from both, indented or not), and after the app branch was
+deleted.
 
 See it any time, without opening the browser:
 ```bash

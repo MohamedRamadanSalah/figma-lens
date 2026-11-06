@@ -67,16 +67,24 @@ export function specHash(dir) {
 /**
  * Screens already built, from commit messages: "Figma-Node: <key>" and "Figma-Spec: <hash>".
  * log: `git log --format=%H%x1f%B%x1e` output. Newest first, so the first one seen per screen wins.
+ * Every pair in a commit counts, indented or not: a squash merge puts all the screens' messages,
+ * indented, into one commit ("Squashed commit of the following: …"), newest first.
  */
 export function builtFromLog(log) {
   const built = new Map();
+  const nodeRe = new RegExp(`^[ \\t>*-]*${NODE_TRAILER}: (\\S+)[ \\t]*$`, 'gm');
+  const specRe = new RegExp(`^[ \\t>*-]*${SPEC_TRAILER}: (\\S+)`, 'm');
   for (const rec of String(log || '').split('\x1e')) {
     const [hash, body] = rec.replace(/^\s+/, '').split('\x1f');
     if (!hash || !body) continue;
-    const node = new RegExp(`^${NODE_TRAILER}: (.+)$`, 'm').exec(body);
-    if (!node || built.has(node[1].trim())) continue;
-    const spec = new RegExp(`^${SPEC_TRAILER}: (\\S+)`, 'm').exec(body);
-    built.set(node[1].trim(), { commit: hash.trim().slice(0, 9), spec: spec ? spec[1] : null });
+    const nodes = [...body.matchAll(nodeRe)];
+    nodes.forEach((m, i) => {
+      if (built.has(m[1])) return;
+      // This screen's spec line: after its node line, before the next screen's node line.
+      const end = i + 1 < nodes.length ? nodes[i + 1].index : body.length;
+      const spec = specRe.exec(body.slice(m.index, end));
+      built.set(m[1], { commit: hash.trim().slice(0, 9), spec: spec ? spec[1] : null });
+    });
   }
   return built;
 }
@@ -318,8 +326,18 @@ export async function collectScreens({ browser, settings, url, st, ifNoLinks, lo
 
 // ---------- the run ----------
 
+/**
+ * Project mode follows the whole prototype: --flow's default limit (30 screens) would cut a bigger app
+ * short while the summary still said "30 of 30 built". A limit the user set (flag or config) still applies.
+ */
+export function projectSettings(settings) {
+  const set = settings.from && settings.from.flowMax && settings.from.flowMax !== 'default';
+  return set ? settings : { ...settings, flowMax: 0 };
+}
+
 /** figma-lens project. settings: browser settings. Returns true when every screen is built. */
 export async function runProject(settings, { url, ifNoLinks, log = console.log, ask = askChoice, cwd = process.cwd() } = {}) {
+  settings = projectSettings(settings);
   const link = resolveLink(url, settings);
   const configFile = findConfig([cwd, path.dirname(cwd)]);
   if (!configFile) throw new Error(`no ${CONFIG_FILE} here: run figma-lens auto --init (and describe your project's structure) first`);
