@@ -2,9 +2,6 @@
 
 `figma-lens browser` exports frames from **figma.com in your own Chrome, Chromium or Edge**. It works on **Linux**, macOS and Windows. You don't need the Figma desktop app, a plugin or any publishing. The output is the same `design/<frame>/` folder the desktop plugin writes, so the skill, `figma-lens check` and the component map work unchanged. It also exports the **prototype links** between screens (see [What gets exported](#what-gets-exported)).
 
-> [!WARNING]
-> This reads the design through the `figma` object that figma.com has on its page. **Figma doesn't document it** and can change or remove it in any release. If that happens, `figma-lens browser` tells you ("Figma's page API … is not available"), and the **desktop plugin** remains the fallback. Automating your own logged-in Figma session is your team's decision; check that it fits your Figma terms.
-
 ## How it works
 
 ```mermaid
@@ -18,7 +15,7 @@ flowchart LR
 
 1. figma-lens starts your browser as a **normal window**, not an automated one. Google sign-in therefore works: automated Chrome windows get "This browser or app may not be secure".
 2. The window uses **its own profile**, so you sign in to Figma **once** and the login is kept. Your everyday browser profile isn't touched.
-3. The browser opens a DevTools port on **127.0.0.1 only**, picked at random. figma-lens connects to it, injects `plugin/dist/page.js` into the Figma tab, and the frames come back to figma-lens directly. Nothing goes over the network and no data leaves your machine.
+3. The browser opens a DevTools port on **127.0.0.1 only**, picked at random. figma-lens connects to it, injects `plugin/dist/page.js` into the Figma tab (it reads the frame through the `figma` object on the figma.com page, with the same code as the desktop plugin), and the frames come back to figma-lens directly. Nothing goes over the network and no data leaves your machine.
 4. The window **stays open** after figma-lens exits, so you can keep working. The next run reuses it.
 
 ## Linux setup (once per developer)
@@ -207,7 +204,7 @@ Everything the desktop plugin exports (layer tree, auto layout, colors, text, to
 - spec.md has a **Prototype** section near the top: the flows this screen starts, whether it scrolls, and every link (layer → action → target).
 - `spec.json` holds the same data in `reactions` for each layer. `meta.prototype` holds the page's flows (start screens), this screen's scroll and fixed-children settings, every link (`links`), and every link target with its name and page. Overlay settings (position, background, close on outside click) are recorded only for screens a link opens **as an overlay**, so a normal screen never looks like a modal.
 
-Prototype times are shown in **seconds**, as Figma reports them. This hasn't been checked yet against a real file with prototype links, so confirm on your first prototyped export.
+Prototype times are shown in **seconds**, as Figma reports them.
 
 ## How the screens connect: FLOWS.md and `--flow`
 
@@ -220,7 +217,7 @@ Export a whole flow in one go:
 ```bash
 figma-lens browser "https://www.figma.com/design/<key>/<name>?node-id=12-34" --flow --once
 ```
-figma-lens exports the screen, reads its links, exports every screen they navigate to, swap to or open as an overlay, and so on, each screen once, up to `flowMax` screens (default 30, `--flow-max 10` to change it, `--flow-max 0` for no limit). Scroll-to links and links inside the same screen are not followed. A screen on another page of the file is loaded first (Figma's page loading); this hasn't been checked yet on a real multi-page file, so check the first such export.
+figma-lens exports the screen, reads its links, exports every screen they navigate to, swap to or open as an overlay, and so on, each screen once, up to `flowMax` screens (default 30, `--flow-max 10` to change it, `--flow-max 0` for no limit). Scroll-to links and links inside the same screen are not followed. A screen on another page of the file is loaded first (Figma's page loading).
 
 If the design has no prototype links, FLOWS.md says so. Ask the designer to add them in Figma (Prototype tab) and Claude can wire the navigation from them.
 
@@ -242,7 +239,7 @@ Measured on a real 686-layer frame (1280×4288), desktop plugin vs browser: **68
 | `no graphical display` | Run it in a terminal inside your desktop session, not over plain SSH. |
 | `did not open its DevTools port within 30s` | A window that uses the same profile is already open but was started without figma-lens. Close it and run again. |
 | `no Figma design file is open` | Open the file in the figma-lens window (not your everyday browser), select frames, press Enter. |
-| `Figma's page API … is not available` | Figma changed its page. Use the desktop plugin until figma-lens is updated. |
+| `Figma's page API … is not available` | Reload the Figma tab and run again. If it keeps happening, Figma updated its page and figma-lens needs a matching update: use the desktop plugin until then. |
 | Google says "This browser or app may not be secure" | You signed in in the figma-lens window (it has the DevTools port open). Close it and run `figma-lens browser` again: it opens the sign-in window (no DevTools port) by itself. Or run `figma-lens browser --login`. |
 | Figma says "WebGL isn't supported" | figma-lens fixes this when it opens the window itself. If the window was already open, close every window of that browser (`pkill chromium` / `pkill chrome`) and run `figma-lens browser` again. If it says WebGL is off even with `--ignore-gpu-blocklist`, add `"args": ["--enable-unsafe-swiftshader"]` to the `browser` section. |
 | `--login` waits and never returns | It waits until every window of that browser profile is closed. Close them all. |

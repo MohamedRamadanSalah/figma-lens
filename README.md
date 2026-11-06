@@ -56,7 +56,7 @@ cp -r skill/figma-lens ~/.claude/skills/   # the Claude Code skill
 
 In the **Figma desktop app**: Plugins → Development → **Import plugin from manifest…** → choose `plugin/manifest.json`. Development plugins can't be imported in the browser.
 
-**No desktop app (Linux, or figma.com only)?** Use `figma-lens browser` instead of the plugin. It exports from figma.com in your own Chrome, Chromium or Edge, with the same output folder and the prototype links between screens. Setup, Linux notes and the `browser` config section: **[docs/BROWSER.md](docs/BROWSER.md)**. It relies on an undocumented figma.com page API; the plugin stays the fallback.
+**No desktop app (Linux, or figma.com only)?** Use `figma-lens browser` instead of the plugin. It exports from figma.com in your own Chrome, Chromium or Edge, with the same output folder and the prototype links between screens. On a real 686-layer frame, a browser export matched the desktop plugin's export exactly (every layer, every icon, 0% pixel difference). Setup, Linux notes and the `browser` config section: **[docs/BROWSER.md](docs/BROWSER.md)**.
 
 Web builds are rendered with your installed **Edge or Chrome** (no browser download). Android builds are captured with **adb**.
 
