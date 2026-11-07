@@ -17,6 +17,7 @@
 //    Figma since, and what is next. design/PROJECT.md shows it after every step. Never touches main,
 //    never pushes.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import readline from 'node:readline';
@@ -118,16 +119,21 @@ export function canvasOrder(frames) {
 }
 
 /** What Claude is told on top of the normal auto prompt: the app around this screen. */
-export function projectPrompt({ screen, index, total, built, next, flowsFile, branch, verify }) {
+export function projectPrompt({ screen, index, total, built, next, flowsFile, branch, verify, kitFile }) {
+  const kit = built.length && kitFile
+    ? `  ${kitFile} lists the files each built screen added: read it first instead of exploring the codebase (\`git show <commit>\` for details).`
+    : '  `git log` and `git show` show what each screen added.';
   return [
     `THIS SCREEN IS PART OF AN APP that figma-lens builds screen by screen, unattended, on branch ${branch}.`,
     `- Screen ${index} of ${total}: ${JSON.stringify(screen.name)}.`,
     `- Already built on this branch (committed): ${built.length ? built.map((n) => JSON.stringify(n)).join(', ') : 'none yet: this is the first screen, so set up shared parts (tokens, kit components, layout) cleanly; the next screens reuse them'}.`,
-    '  Reuse what they added (UI components, icons, tokens, layout); never make a second copy of something that exists. `git log` and `git show` show what each screen added.',
+    '  Reuse what they added (UI components, icons, tokens, layout); never make a second copy of something that exists.',
+    kit,
     `- Still to build after this one: ${next.length ? next.map((n) => JSON.stringify(n)).join(', ') : 'none (this is the last screen)'}. Don't build them now.`,
     `- Navigation: ${flowsFile} lists the prototype links between the screens (spec.md shows them under each layer, lines starting with →). Wire this screen's links: to a screen already built, use its route; to a screen not built yet, use the route it will get (its name in kebab-case), it is built later in this run.`,
     "- Open only this screen's export images, never another screen's.",
     `- figma-lens commits this screen for you when you are done${verify ? ` and \`${verify}\` passes in this checkout; run it yourself before you finish` : ''}. Do not commit.`,
+    "- Don't change the project's checks (package.json scripts, lint, tsconfig or analysis options) to make them pass. If a change there is really needed, explain it in your report: figma-lens flags such changes for review.",
   ].join('\n');
 }
 
@@ -148,7 +154,7 @@ export function renderProjectMd(state) {
     '',
     '| # | Screen | Status | Commit | Notes |',
     '|---|---|---|---|---|',
-    ...s.map((x, i) => `| ${i + 1} | ${String(x.name).replace(/\|/g, '\\|')} | ${statusText[x.status] || x.status} | ${x.commit ? `\`${x.commit}\`` : '—'} | ${String(x.reason || (x.status === 'changed' ? 'design changed after it was built: rebuild it by hand, or ask Claude to update it' : '')).replace(/\|/g, '\\|').replace(/\n/g, ' ').slice(0, 200)}${x.patch ? ` (attempt saved: \`${x.patch}\`)` : ''} |`),
+    ...s.map((x, i) => `| ${i + 1} | ${String(x.name).replace(/\|/g, '\\|')} | ${statusText[x.status] || x.status} | ${x.commit ? `\`${x.commit}\`` : '—'} | ${String(x.reason || (x.status === 'changed' ? 'design changed after it was built: rebuild it by hand, or ask Claude to update it' : '') || (x.verifyChanged && x.verifyChanged.length ? `⚠ changed the project's checks (${x.verifyChanged.join(', ')}): review that` : '')).replace(/\|/g, '\\|').replace(/\n/g, ' ').slice(0, 200)}${x.patch ? ` (attempt saved: \`${x.patch}\`)` : ''} |`),
     '',
     '## Review and keep',
     '```',
@@ -210,7 +216,7 @@ export function commitScreen({ worktree, top, screen }) {
   git([...id, 'commit', '-q',
     '-m', `figma: ${screen.name}`,
     '-m', `Built by figma-lens project from the Figma screen ${JSON.stringify(screen.name)} (export: ${path.basename(screen.dir)}).`,
-    '-m', `${NODE_TRAILER}: ${screen.key}\n${SPEC_TRAILER}: ${screen.spec}`], worktree);
+    '-m', `${NODE_TRAILER}: ${screen.key}\n${SPEC_TRAILER}: ${screen.spec}${screen.verifyChanged && screen.verifyChanged.length ? `\n${VERIFY_CHANGED_TRAILER}: ${screen.verifyChanged.join(', ')}` : ''}`], worktree);
   return git(['rev-parse', '--short=9', 'HEAD'], worktree).trim();
 }
 
@@ -239,6 +245,154 @@ export function runVerify(command, cwd) {
   const r = spawnSync(command, { cwd, shell: true, encoding: 'utf8', timeout: 30 * 60 * 1000, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, NO_COLOR: '1', CI: '1' } });
   const output = `${r.stdout || ''}${r.stderr || ''}`.split(/\r?\n/).slice(-80).join('\n');
   return { ok: r.status === 0, output: r.error ? `${r.error.message}\n${output}` : output };
+}
+
+/**
+ * The part of a failed verify that a retry needs: the error lines (file:line, "error", "failed"),
+ * at most `max` of them; without any recognisable error line, the last `max` lines.
+ */
+export function errorLines(output, max = 40) {
+  const lines = String(output || '').split(/\r?\n/).filter((l) => l.trim());
+  const hits = lines.filter((l) => /\berror\b|ERR!|✖|✗|\bfail(ed|ing|ure)?\b|:\d+:\d+/i.test(l));
+  return (hits.length ? hits : lines).slice(-max).join('\n');
+}
+
+// Files that decide what auto.verify checks. Claude may edit them in the worktree, so a change is
+// flagged on the commit (trailer) and in PROJECT.md instead of being trusted silently.
+const CHECK_FILES = [
+  'package.json', 'tsconfig.json', 'tsconfig.app.json', '.eslintrc', '.eslintrc.json', '.eslintrc.js', '.eslintrc.cjs',
+  'eslint.config.js', 'eslint.config.mjs', 'eslint.config.cjs', 'analysis_options.yaml', 'pubspec.yaml',
+];
+export const VERIFY_CHANGED_TRAILER = 'Figma-Verify-Changed';
+
+/**
+ * { file: fingerprint|null } for the check files in dir. package.json counts only its "scripts".
+ * read(file) can read another version (e.g. the last commit) instead of the files on disk.
+ */
+export function checksFingerprint(dir, read = (f) => fs.readFileSync(path.join(dir, f), 'utf8')) {
+  const out = {};
+  for (const f of CHECK_FILES) {
+    let text = null;
+    try {
+      text = read(f);
+    } catch {
+      text = null;
+    }
+    if (text !== null && f === 'package.json') {
+      try {
+        text = JSON.stringify(JSON.parse(text).scripts || {});
+      } catch {
+        // unparsable package.json: compare the raw text
+      }
+    }
+    out[f] = text === null ? null : crypto.createHash('sha1').update(text).digest('hex');
+  }
+  return out;
+}
+
+export function changedChecks(before, after) {
+  return Object.keys({ ...before, ...after }).filter((f) => (before[f] || null) !== (after[f] || null));
+}
+
+// ---------- the app's kit (what each built screen added) ----------
+
+export const KIT_FILE = 'KIT.md';
+
+/** design/KIT.md: per built screen, the files its commit added or changed, so later screens reuse them. */
+export function kitMarkdown(entries) {
+  const out = ['# What each built screen added (figma-lens project)', '', 'Reuse these; never make a second copy. `git show <commit>` shows the details.', ''];
+  for (const e of entries) {
+    out.push(`## ${e.name} (\`${e.commit}\`)`);
+    const files = e.files.slice(0, 60);
+    out.push(...(files.length ? files.map((f) => `- ${f.status === 'A' ? 'added' : 'changed'} \`${f.path}\``) : ['- (no file list)']));
+    if (e.files.length > files.length) out.push(`- … and ${e.files.length - files.length} more`);
+    out.push('');
+  }
+  return out.join('\n');
+}
+
+function writeKit(out, worktree, screens) {
+  const entries = screens.filter((s) => s.commit && (s.status === 'done' || s.status === 'changed')).map((s) => {
+    let files = [];
+    try {
+      files = git(['show', '--name-status', '--format=', s.commit], worktree)
+        .split('\n').map((l) => l.split('\t')).filter((p) => p.length >= 2 && /^[AM]/.test(p[0]))
+        .map((p) => ({ status: p[0][0], path: p[p.length - 1] }));
+    } catch {
+      files = []; // e.g. a squash-merged commit that is not in this repository's history
+    }
+    return { name: s.name, commit: s.commit, files };
+  });
+  const file = path.join(out, KIT_FILE);
+  fs.writeFileSync(file, kitMarkdown(entries));
+  return file;
+}
+
+// ---------- one run per app at a time ----------
+
+export const LOCK_FILE = '.figma-lens-project.lock';
+const SAME_HOST_MAX_MS = 6 * 60 * 60 * 1000; // far longer than any synchronous step (auto.verify stops at 30 min)
+
+const pidAlive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM'; // exists, owned by someone else
+  }
+};
+
+/**
+ * Take the project lock in `out` (the design folder), or throw. A lock is stale, and taken over, when
+ * its process is gone (same machine) or it has not been refreshed for staleMs (any machine).
+ * Returns release(). The lock is refreshed every minute while held.
+ */
+export function acquireLock(out, { staleMs = 25 * 60 * 1000, now = Date.now, alive = pidAlive } = {}) {
+  fs.mkdirSync(out, { recursive: true });
+  const file = path.join(out, LOCK_FILE);
+  const mine = { pid: process.pid, host: os.hostname(), startedAt: new Date(now()).toISOString() };
+  for (let tries = 0; tries < 2; tries++) {
+    try {
+      fs.writeFileSync(file, JSON.stringify(mine), { flag: 'wx' });
+      const beat = setInterval(() => {
+        try {
+          const t = new Date();
+          fs.utimesSync(file, t, t);
+        } catch {
+          // lock file removed by hand: nothing to refresh
+        }
+      }, 60 * 1000);
+      beat.unref();
+      return () => {
+        clearInterval(beat);
+        try {
+          const held = JSON.parse(fs.readFileSync(file, 'utf8'));
+          if (held.pid === mine.pid && held.host === mine.host) fs.rmSync(file, { force: true });
+        } catch {
+          // already gone
+        }
+      };
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+    }
+    let held = null;
+    let age = 0;
+    try {
+      held = JSON.parse(fs.readFileSync(file, 'utf8'));
+      age = now() - fs.statSync(file).mtimeMs;
+    } catch {
+      held = null; // unreadable or vanished: treat as stale
+    }
+    // Same machine: the process tells the truth (a long synchronous verify pauses the heartbeat while
+    // the run is alive); only a lock untouched for far longer than any verify (pid reused) is stale.
+    // Another machine: the heartbeat is all there is.
+    const stale = !held || (held.host === mine.host ? !alive(held.pid) || age > SAME_HOST_MAX_MS : age > staleMs);
+    if (!stale) {
+      throw new Error(`another figma-lens project run is working on this app (pid ${held.pid} on ${held.host}, since ${held.startedAt}). Wait for it to finish, or stop it. If it is not running, delete ${file}.`);
+    }
+    fs.rmSync(file, { force: true });
+  }
+  throw new Error(`could not take the project lock ${file}`);
 }
 
 // ---------- state ----------
@@ -344,6 +498,18 @@ export async function runProject(settings, { url, ifNoLinks, log = console.log, 
   const cfg = loadAutoConfig(configFile);
   const command = `figma-lens project${link ? ` "${link}"` : ''}`;
 
+  // One run per app from the very start: two runs exporting into the same design folder collide too.
+  const release = acquireLock(settings.out, { staleMs: lockStaleMs(cfg) });
+  try {
+    return await exportAndBuild({ settings, link, cfg, configFile, command, ifNoLinks, log, ask });
+  } finally {
+    release();
+  }
+}
+
+const lockStaleMs = (cfg) => ((Number(cfg && cfg.idleMinutes) || 20) + 5) * 60 * 1000;
+
+async function exportAndBuild({ settings, link, cfg, configFile, command, ifNoLinks, log, ask }) {
   // 1. Export the app's screens (the browser is only needed for this part).
   const ready = await openReady(settings, { log });
   let screens;
@@ -366,7 +532,7 @@ export async function runProject(settings, { url, ifNoLinks, log = console.log, 
     key: screenKey(st.fileKey, st.file, r.nodeId),
     spec: specHash(r.dir),
   }));
-  const r = await buildApp({ screens, file: st.file, fileKey: st.fileKey, cfg, configFile, out: settings.out, command, log });
+  const r = await buildAppLocked({ screens, file: st.file, fileKey: st.fileKey, cfg, configFile, out: settings.out, command, log });
   return r.ok;
 }
 
@@ -374,7 +540,17 @@ export async function runProject(settings, { url, ifNoLinks, log = console.log, 
  * Build the screens on one branch (step 2+ of runProject; separate so it can be tested without a browser).
  * runScreen / verify are injectable for tests.
  */
-export async function buildApp({ screens, file, fileKey, cfg, configFile, out, command, log = console.log, runScreen = runJob, verify = runVerify }) {
+export async function buildApp(opts) {
+  // One run per app: a second run would build in the same worktree and commit over the first one.
+  const release = acquireLock(opts.out, { staleMs: lockStaleMs(opts.cfg) });
+  try {
+    return await buildAppLocked(opts);
+  } finally {
+    release();
+  }
+}
+
+async function buildAppLocked({ screens, file, fileKey, cfg, configFile, out, command, log = console.log, runScreen = runJob, verify = runVerify }) {
   // One worktree, one branch for the whole app.
   const key = `app-${slug(file)}`;
   const plan = planWorktree({ projectDir: cfg.projectDir, key, worktreeRoot: cfg.worktreeRoot });
@@ -412,11 +588,14 @@ export async function buildApp({ screens, file, fileKey, cfg, configFile, out, c
   log(c.gray(`Progress: ${path.join(out, REPORT_FILE)}`));
 
   const flowsFile = path.join(out, 'FLOWS.md');
+  let kitFile = writeKit(out, plan.worktree, state.screens);
   let stopped = null;
   for (let i = 0; i < order.length && !stopped; i++) {
     const s = order[i];
     const builtNames = state.screens.filter((x) => x.status === 'done' || x.status === 'changed').map((x) => x.name);
-    const context = projectPrompt({ screen: s, index: builtNames.length + 1, total: state.screens.length, built: builtNames, next: order.slice(i + 1).map((x) => x.name), flowsFile, branch: plan.branch, verify: cfg.verify });
+    const context = projectPrompt({ screen: s, index: builtNames.length + 1, total: state.screens.length, built: builtNames, next: order.slice(i + 1).map((x) => x.name), flowsFile, branch: plan.branch, verify: cfg.verify, kitFile });
+    // The checks as of the last good screen (HEAD), so partial work left from a previous run counts too.
+    const checksBefore = checksFingerprint(plan.workDir, (f) => git(['show', `HEAD:./${f}`], plan.workDir));
     log('');
     log(c.bold(c.cyan(`[${i + 1}/${order.length}] ${s.name}`)) + c.gray(` (screen ${builtNames.length + 1} of ${state.screens.length} in the app)`));
     s.status = 'building';
@@ -450,9 +629,13 @@ export async function buildApp({ screens, file, fileKey, cfg, configFile, out, c
         reason = `\`${cfg.verify}\` failed`;
         log(c.red(`✖ ${s.name}: ${reason}`));
         log(c.gray(v.output.split('\n').slice(-8).map((l) => `  ${l}`).join('\n')));
-        note = `Your work on this screen is in this checkout, but \`${cfg.verify}\` fails. Fix it (keep the screen; don't remove checks):\n\n${v.output}`;
+        // Only the error lines: the whole log would fill the retry's context with noise.
+        note = `Your work on this screen is in this checkout, but \`${cfg.verify}\` fails. Fix it (keep the screen; don't remove checks). The errors:\n\n${errorLines(v.output)}`;
         continue;
       }
+      const touched = changedChecks(checksBefore, checksFingerprint(plan.workDir));
+      if (touched.length) s.verifyChanged = touched;
+      else delete s.verifyChanged;
       try {
         s.commit = commitScreen({ worktree: plan.worktree, top: plan.top, screen: s });
         s.status = 'done';
@@ -460,6 +643,8 @@ export async function buildApp({ screens, file, fileKey, cfg, configFile, out, c
         delete s.patch;
         done = true;
         log(`${c.green(c.bold('✔'))} ${c.bold(s.name)} built and committed ${c.cyan(s.commit)} on ${plan.branch}`);
+        if (touched.length) log(c.yellow(`  ⚠ this screen changed the project's checks (${touched.join(', ')}): review that change`));
+        kitFile = writeKit(out, plan.worktree, state.screens);
       } catch (e) {
         reason = `the commit failed: ${e.message}`; // e.g. the project's own git hooks
         note = `figma-lens could not commit your work: ${e.message}. Fix what it complains about.`;

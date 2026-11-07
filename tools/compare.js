@@ -264,12 +264,56 @@ export function computeDiff({ designDir, actualFile, cropTop = 0, cropBottom = 0
   };
 }
 
-function reportMarkdown(meta, stats, files, prev) {
+export const TARGET_PCT = 3; // mismatch % at or under this is done
+export const MIN_GAIN = 0.2; // percentage points: a smaller change than this against the session's best is "flat"
+export const MAX_CHECKS = 6; // checks per Claude session; the 6th check always stops
+const EPS = 1e-9; // so a change of exactly MIN_GAIN counts (3.3 - 0.2 is 3.0999999999999996 in JS)
+
+const improvedOn = (best, pct) => pct <= best - MIN_GAIN + EPS;
+const worseThan = (best, pct) => pct >= best + MIN_GAIN - EPS;
+
+/**
+ * Whether another fix-and-check round is worth it, judged against this session's earlier checks
+ * (`earlier`: their mismatch % in order, oldest first; `best` is the lowest of them). Rules, in order:
+ * target (≤ TARGET_PCT) → STOP; first check → CONTINUE; MAX_CHECKS reached → STOP "limit";
+ * improved on best by MIN_GAIN → CONTINUE; worse than best by MIN_GAIN → CONTINUE "regressed"
+ * (undo the last change); otherwise flat → STOP "plateau" on the 2nd non-improving check in a row.
+ * A worse check counts as non-improving but never stops on its own: stopping there would finish
+ * with a worse screen than the session already had.
+ * { stop: boolean, why: 'target' | 'plateau' | 'regressed' | 'limit' | null, text, best }
+ */
+export function verdictFor(mismatchPct, earlier = []) {
+  let best = null;
+  let streak = 0; // non-improving (worse or flat) checks in a row
+  for (const pct of earlier) {
+    if (best == null || improvedOn(best, pct)) streak = 0;
+    else streak++;
+    best = best == null ? pct : Math.min(best, pct);
+  }
+  const v = (stop, why, text) => ({ stop, why, text, best });
+  if (mismatchPct <= TARGET_PCT) return v(true, 'target', `STOP: ${mismatchPct}% is within the ${TARGET_PCT}% target. Finish and write the report.`);
+  if (best == null) return v(false, null, 'CONTINUE: fix the biggest differences below, then check again.');
+  if (earlier.length + 1 >= MAX_CHECKS) {
+    return v(true, 'limit', worseThan(best, mismatchPct)
+      ? `STOP: check limit reached (${MAX_CHECKS} checks), and the current code (${mismatchPct}%) is worse than your best result (${best}%). Restore the version that scored ${best}% before finishing (do not check again), then report what still differs and why.`
+      : `STOP: check limit reached (${MAX_CHECKS} checks; now ${mismatchPct}%, best ${best}%). Do not check again; report what still differs and why.`);
+  }
+  if (improvedOn(best, mismatchPct)) return v(false, null, `CONTINUE: improved on your best (${best}% → ${mismatchPct}%). Fix the biggest differences below, then check again.`);
+  if (worseThan(best, mismatchPct)) return v(false, 'regressed', `CONTINUE: your last change made it worse (best ${best}%, now ${mismatchPct}%). Undo that change, then check again.`);
+  if (streak + 1 >= 2) return v(true, 'plateau', `STOP: no real improvement in the last 2 checks (best ${best}%, now ${mismatchPct}%). Further rounds are unlikely to help; report what still differs and why.`);
+  return v(false, null, `CONTINUE: about the same as your best (${best}%, now ${mismatchPct}%). Try a different fix for the biggest differences below, then check again.`);
+}
+
+function reportMarkdown(meta, stats, files, prev, verdict) {
   const out = [];
   out.push(`# Compare: ${meta.nodeName}`);
   out.push('');
-  const trend = prev != null ? ` (previous run ${prev}%)` : '';
+  const trend = prev != null || verdict.best != null
+    ? ` (${[prev != null ? `previous run ${prev}%` : '', verdict.best != null ? `best this session ${verdict.best}%` : ''].filter(Boolean).join(', ')})`
+    : '';
   out.push(`**Mismatch: ${stats.mismatchPct}%** of compared pixels${trend}. Target: under 2–3% (text anti-aliasing never reaches 0).`);
+  out.push('');
+  out.push(`**Verdict: ${verdict.text}**`);
   out.push('');
   if (stats.text.pixels) {
     out.push(stats.text.ignoredNoisePx
@@ -334,11 +378,19 @@ export function compare(opts) {
   // Only a run scored the same way is a fair "previous".
   const last = history.length ? history[history.length - 1] : null;
   const prev = last && (last.metric || 'pixel') === stats.metric ? last.mismatchPct : null;
-  history.push({ at: new Date().toISOString(), metric: stats.metric, mismatchPct: stats.mismatchPct, rawMismatchPct: stats.rawMismatchPct, actual: path.resolve(opts.actualFile) });
+  // The verdict judges only checks from the same Claude session (auto mode sets FIGMA_LENS_RUN per
+  // session), so a retry's first check is not stopped by the last attempt's scores. Without a run id
+  // there is no session to judge against: manual checks pile up across days and would hit MAX_CHECKS.
+  const run = opts.runId !== undefined ? opts.runId : process.env.FIGMA_LENS_RUN || null;
+  const earlier = run
+    ? history.filter((h) => h && h.run === run && (h.metric || 'pixel') === stats.metric && typeof h.mismatchPct === 'number').map((h) => h.mismatchPct)
+    : [];
+  const verdict = verdictFor(stats.mismatchPct, earlier);
+  history.push({ at: new Date().toISOString(), metric: stats.metric, mismatchPct: stats.mismatchPct, rawMismatchPct: stats.rawMismatchPct, actual: path.resolve(opts.actualFile), ...(run ? { run } : {}) });
   fs.writeFileSync(historyFile, JSON.stringify(history, null, 1));
 
-  const report = { frame: meta.nodeName, ...stats, files, previousMismatchPct: prev };
+  const report = { frame: meta.nodeName, ...stats, files, previousMismatchPct: prev, bestMismatchPct: verdict.best, verdict };
   fs.writeFileSync(path.join(outDir, 'report.json'), JSON.stringify(report, null, 1));
-  fs.writeFileSync(path.join(outDir, 'report.md'), reportMarkdown(meta, stats, files, prev));
+  fs.writeFileSync(path.join(outDir, 'report.md'), reportMarkdown(meta, stats, files, prev, verdict));
   return { ...report, reportFile: path.join(outDir, 'report.md') };
 }
