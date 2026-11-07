@@ -51,7 +51,8 @@ cd figma-lens
 npm install
 npm run build                       # type-checks and bundles plugin/dist/code.js
 npm link                            # optional: makes the `figma-lens` command global
-cp -r skill/figma-lens ~/.claude/skills/   # the Claude Code skill
+cp -r skill/figma-lens ~/.claude/skills/          # the Claude Code skill
+cp -r skill/figma-lens-review ~/.claude/skills/   # optional: review screens after later changes
 ```
 
 In the **Figma desktop app**: Plugins → Development → **Import plugin from manifest…** → choose `plugin/manifest.json`. Development plugins can't be imported in the browser.
@@ -238,6 +239,21 @@ Statuses: `done` (finished and changed files), `no-changes` (finished without bu
 - This is a guard, not a sandbox: Claude runs your project's own tools (npm, flutter…) inside the worktree.
 
 `figma-lens auto --design design/<frame> --dry-run` prints the exact command, folder and prompt without running anything. Leave out `--dry-run` to retry a frame by hand. Re-running a frame reuses its worktree and branch. When you're done with one, remove it with `git worktree remove ../<project>-figma/<frame>`.
+
+## Review screens after a change: the `figma-lens-review` skill
+
+Once the screens are built, other work changes them: a backend dev links the APIs and real data, someone refactors
+a shared component. The `figma-lens-review` skill checks that nothing broke. Ask Claude something like
+"review the screens after my last commit" (or run it before a PR). It is not part of the auto or project loop;
+anyone runs it when they want a review.
+
+1. It picks what to compare (the commit before, the branch base, or a ref you name) and finds the screens the change touches (from `design/KIT.md` and the imports).
+2. It runs the **before** code in a temporary git worktree (your checkout is never touched) and the **after** code from your checkout, with the same backend and data.
+3. For every screen it takes both screenshots and scores both against the Figma export, so you see which screens drifted from the design because of the change, by area and Figma layer. Real data replacing the design's sample text counts as expected, not as a regression.
+4. It looks at the new screens for real-data problems: overflowing text, broken images, raw numbers and dates, leftover sample text, and missing empty/loading/error states.
+5. It writes `design/REVIEW.md` (a table of before/after scores, then the problems) and offers fixes; it changes no code unless you ask.
+
+Web only for now (including Flutter web).
 
 ## All commands
 
