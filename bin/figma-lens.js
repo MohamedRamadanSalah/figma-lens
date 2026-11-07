@@ -2,6 +2,7 @@
 // figma-lens CLI: bridge, render, compare-and-fix, component map, demo.
 import fs from 'node:fs';
 import path from 'node:path';
+import net from 'node:net';
 import { startBridge, writeDerived } from '../bridge/server.js';
 import { summarizeUsage } from '../bridge/render-md.js';
 import { compare } from '../tools/compare.js';
@@ -57,6 +58,10 @@ Usage:
 
   figma-lens check   --design design/<frame> (--url <page url> | --adb) [--viewport] [--crop-top px] [--crop-bottom px] [--fail-above pct] [--text-tolerance units]
       Render your build and compare it with the Figma frame (shot + compare in one step).
+      The last line is a verdict: STOP (within 3%, or no real improvement since the last check) or CONTINUE.
+
+  figma-lens port
+      Print a free TCP port on 127.0.0.1 (for a dev server).
       Web pages are captured full-page, so a build taller than the frame is reported instead of
       cut off. --viewport captures only the frame-sized viewport (e.g. a scrolling app screen
       whose frame shows one screenful); full-page capture also resizes 100vh / position:fixed.
@@ -149,6 +154,7 @@ function printCompare(r, flags) {
     }
     console.log(`${c.gray('report:')} ${r.reportFile}`);
     console.log(`${c.gray('Figma | build | diff:')} ${r.files.sideBySide}`);
+    if (r.verdict) console.log(r.verdict.stop ? c.green(r.verdict.text) : c.yellow(r.verdict.text));
   }
   if (flags['fail-above'] !== undefined && r.mismatchPct > Number(flags['fail-above'])) process.exitCode = 1;
 }
@@ -223,6 +229,14 @@ async function main() {
       });
       printCompare(r, flags);
       return;
+    }
+
+    case 'port': {
+      const srv = net.createServer();
+      await new Promise((resolve, reject) => srv.once('error', reject).listen(0, '127.0.0.1', resolve));
+      console.log(srv.address().port);
+      await new Promise((resolve) => srv.close(resolve));
+      break;
     }
 
     case 'check': {

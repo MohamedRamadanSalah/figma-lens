@@ -275,3 +275,17 @@ test('CLI: help, compare --fail-above exit code, render with map', () => {
   assert.equal(bad.status, 2);
   assert.match(bad.stderr, /not a figma-lens export/);
 });
+
+test('verdict: "no improvement" only against a check from the same Claude session', () => {
+  const root = tmp();
+  const dir = makeExport(root);
+  const shot = path.join(root, 'off.png');
+  writePng(shot, drawScreen({ cardX: 80 }));
+  const a1 = compare({ designDir: dir, actualFile: shot, runId: 'a' });
+  assert.ok(a1.mismatchPct > 3, `mismatch ${a1.mismatchPct}%`);
+  assert.equal(a1.verdict.stop, false);
+  assert.equal(compare({ designDir: dir, actualFile: shot, runId: 'a' }).verdict.why, 'plateau', 'same session, same score: stop');
+  const b1 = compare({ designDir: dir, actualFile: shot, runId: 'b' });
+  assert.equal(b1.verdict.stop, false, "a retry's first check is not judged against the last attempt");
+  assert.match(fs.readFileSync(path.join(dir, 'compare', 'report.md'), 'utf8'), /Verdict: CONTINUE/);
+});

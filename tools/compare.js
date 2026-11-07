@@ -264,12 +264,28 @@ export function computeDiff({ designDir, actualFile, cropTop = 0, cropBottom = 0
   };
 }
 
-function reportMarkdown(meta, stats, files, prev) {
+export const TARGET_PCT = 3;
+const MIN_GAIN = 0.2; // percentage points: less than this since the last run is "no improvement"
+
+/**
+ * Whether another fix-and-check round is worth it. The compare loop used to rely on Claude applying
+ * the stop rule itself; in real runs it often did one more round that changed nothing (1.8% → 1.8%).
+ * { stop: boolean, why: 'target' | 'plateau' | null, text }
+ */
+export function verdictFor(mismatchPct, prev) {
+  if (mismatchPct <= TARGET_PCT) return { stop: true, why: 'target', text: `STOP: ${mismatchPct}% is within the ${TARGET_PCT}% target. Finish and write the report.` };
+  if (prev != null && prev - mismatchPct < MIN_GAIN) return { stop: true, why: 'plateau', text: `STOP: no real improvement since the previous run (${prev}% → ${mismatchPct}%). Further rounds are unlikely to help; report what still differs and why.` };
+  return { stop: false, why: null, text: 'CONTINUE: fix the biggest differences below, then check again.' };
+}
+
+function reportMarkdown(meta, stats, files, prev, verdict = verdictFor(stats.mismatchPct, prev)) {
   const out = [];
   out.push(`# Compare: ${meta.nodeName}`);
   out.push('');
   const trend = prev != null ? ` (previous run ${prev}%)` : '';
   out.push(`**Mismatch: ${stats.mismatchPct}%** of compared pixels${trend}. Target: under 2–3% (text anti-aliasing never reaches 0).`);
+  out.push('');
+  out.push(`**Verdict: ${verdict.text}**`);
   out.push('');
   if (stats.text.pixels) {
     out.push(stats.text.ignoredNoisePx
@@ -334,11 +350,15 @@ export function compare(opts) {
   // Only a run scored the same way is a fair "previous".
   const last = history.length ? history[history.length - 1] : null;
   const prev = last && (last.metric || 'pixel') === stats.metric ? last.mismatchPct : null;
-  history.push({ at: new Date().toISOString(), metric: stats.metric, mismatchPct: stats.mismatchPct, rawMismatchPct: stats.rawMismatchPct, actual: path.resolve(opts.actualFile) });
+  // "No improvement" only counts against a check from the same Claude session (auto mode sets
+  // FIGMA_LENS_RUN per session): a retry's first check must not stop on the last attempt's score.
+  const run = opts.runId !== undefined ? opts.runId : process.env.FIGMA_LENS_RUN || null;
+  const verdict = verdictFor(stats.mismatchPct, last && (last.run || null) === run ? prev : null);
+  history.push({ at: new Date().toISOString(), metric: stats.metric, mismatchPct: stats.mismatchPct, rawMismatchPct: stats.rawMismatchPct, actual: path.resolve(opts.actualFile), ...(run ? { run } : {}) });
   fs.writeFileSync(historyFile, JSON.stringify(history, null, 1));
 
-  const report = { frame: meta.nodeName, ...stats, files, previousMismatchPct: prev };
+  const report = { frame: meta.nodeName, ...stats, files, previousMismatchPct: prev, verdict };
   fs.writeFileSync(path.join(outDir, 'report.json'), JSON.stringify(report, null, 1));
-  fs.writeFileSync(path.join(outDir, 'report.md'), reportMarkdown(meta, stats, files, prev));
+  fs.writeFileSync(path.join(outDir, 'report.md'), reportMarkdown(meta, stats, files, prev, verdict));
   return { ...report, reportFile: path.join(outDir, 'report.md') };
 }

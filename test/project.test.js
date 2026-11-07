@@ -356,3 +356,82 @@ test('not signed in: the plain sign-in window opens by itself, then figma-lens c
   }), /still not signed in to Figma/);
   assert.equal(dropped, true);
 });
+
+// ---------- one run at a time, kit, verify notes, changed checks ----------
+
+test('project lock: a second run is refused; a dead or silent holder is taken over; released after the run', async () => {
+  const { acquireLock, LOCK_FILE } = await import('../tools/project.js');
+  const out = tmp();
+  const release = acquireLock(out);
+  assert.throws(() => acquireLock(out), /another figma-lens project run is working on this app/);
+  release();
+  assert.equal(fs.existsSync(path.join(out, LOCK_FILE)), false);
+  // holder process gone (same machine): stale
+  fs.writeFileSync(path.join(out, LOCK_FILE), JSON.stringify({ pid: 999999, host: os.hostname(), startedAt: 'x' }));
+  acquireLock(out, { alive: () => false })();
+  // other machine, not refreshed for longer than staleMs: stale
+  fs.writeFileSync(path.join(out, LOCK_FILE), JSON.stringify({ pid: 1, host: 'elsewhere', startedAt: 'x' }));
+  assert.throws(() => acquireLock(out, { staleMs: 60000 }), /another figma-lens project run/);
+  acquireLock(out, { staleMs: 60000, now: () => Date.now() + 120000 })();
+
+  const p = project();
+  const hold = acquireLock(p.out);
+  const claude = fakeClaude(p.worktree);
+  await assert.rejects(buildApp({ screens: [p.screen('Login', '1:1')], file: 'Shop', fileKey: 'KEY', cfg: p.cfg, configFile: p.configFile, out: p.out, command: 'c', log: quiet, runScreen: claude.run, verify: ok }), /another figma-lens project run/);
+  assert.equal(claude.calls.length, 0, 'nothing ran');
+  hold();
+  const r = await buildApp({ screens: [p.screen('Login', '1:1')], file: 'Shop', fileKey: 'KEY', cfg: p.cfg, configFile: p.configFile, out: p.out, command: 'c', log: quiet, runScreen: claude.run, verify: ok });
+  assert.equal(r.ok, true);
+  assert.equal(fs.existsSync(path.join(p.out, LOCK_FILE)), false, 'released after the run');
+});
+
+test('KIT.md lists what each built screen added, and later screens are pointed at it', async () => {
+  const p = project();
+  const claude = fakeClaude(p.worktree);
+  await buildApp({ screens: [p.screen('Login', '1:1'), p.screen('Home', '2:1')], file: 'Shop', fileKey: 'KEY', cfg: p.cfg, configFile: p.configFile, out: p.out, command: 'c', log: quiet, runScreen: claude.run, verify: ok });
+  const kit = fs.readFileSync(path.join(p.out, 'KIT.md'), 'utf8');
+  assert.match(kit, /## Login \(`[0-9a-f]+`\)\n- added `src\/login.txt`/);
+  assert.match(kit, /## Home/);
+  assert.doesNotMatch(claude.calls[0].extra, /KIT\.md/, 'nothing built yet: no kit to point at');
+  assert.match(claude.calls[1].extra, /KIT\.md lists the files each built screen added/);
+});
+
+test('a failed verify gives the retry only the error lines', async () => {
+  const { errorLines } = await import('../tools/project.js');
+  const log = [...Array.from({ length: 300 }, (_, i) => `building module ${i}`), 'src/a.ts:3:5 - error TS2322: bad type', 'npm ERR! verify failed', 'done'].join('\n');
+  assert.equal(errorLines(log), 'src/a.ts:3:5 - error TS2322: bad type\nnpm ERR! verify failed');
+  assert.equal(errorLines('a\nb\nc', 2), 'b\nc', 'no recognisable error line: the last lines');
+
+  const p = project({ fixRetries: 1 });
+  const claude = fakeClaude(p.worktree);
+  let n = 0;
+  await buildApp({ screens: [p.screen('Login', '1:1')], file: 'Shop', fileKey: 'KEY', cfg: p.cfg, configFile: p.configFile, out: p.out, command: 'c', log: quiet, runScreen: claude.run, verify: () => (++n === 1 ? { ok: false, output: log } : ok()) });
+  assert.match(claude.calls[1].extra, /The errors:\n\nsrc\/a\.ts:3:5 - error TS2322: bad type\nnpm ERR! verify failed$/);
+  assert.doesNotMatch(claude.calls[1].extra, /building module/);
+});
+
+test('a screen that changes the project checks is committed, but flagged (trailer + PROJECT.md)', async () => {
+  const p = project();
+  const claude = fakeClaude(p.worktree);
+  const run = async (o) => {
+    fs.writeFileSync(path.join(p.worktree, 'package.json'), JSON.stringify({ scripts: { verify: 'exit 0' } }));
+    return claude.run(o);
+  };
+  const r = await buildApp({ screens: [p.screen('Login', '1:1')], file: 'Shop', fileKey: 'KEY', cfg: p.cfg, configFile: p.configFile, out: p.out, command: 'c', log: quiet, runScreen: run, verify: ok });
+  assert.equal(r.ok, true);
+  assert.match(git(p.worktree, 'log', '-1', '--format=%B'), /Figma-Verify-Changed: package\.json/);
+  assert.match(fs.readFileSync(path.join(p.out, 'PROJECT.md'), 'utf8'), /changed the project's checks \(package\.json\)/);
+  // the next screen leaves the checks alone: no flag
+  const claude2 = fakeClaude(p.worktree);
+  await buildApp({ screens: [p.screen('Login', '1:1'), p.screen('Home', '2:1')], file: 'Shop', fileKey: 'KEY', cfg: p.cfg, configFile: p.configFile, out: p.out, command: 'c', log: quiet, runScreen: claude2.run, verify: ok });
+  assert.doesNotMatch(git(p.worktree, 'log', '-1', '--format=%B'), /Figma-Verify-Changed/);
+});
+
+test('project lock on the same machine follows the process, not the heartbeat (a long verify pauses it)', async () => {
+  const { acquireLock, LOCK_FILE } = await import('../tools/project.js');
+  const out = tmp();
+  fs.writeFileSync(path.join(out, LOCK_FILE), JSON.stringify({ pid: 4242, host: os.hostname(), startedAt: 'x' }));
+  const later = () => Date.now() + 60 * 60 * 1000; // heartbeat an hour old, process alive
+  assert.throws(() => acquireLock(out, { staleMs: 60000, now: later, alive: () => true }), /another figma-lens project run/);
+  acquireLock(out, { staleMs: 60000, now: later, alive: () => false })();
+});

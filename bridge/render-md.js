@@ -185,11 +185,16 @@ const TRIGGERS = {
 };
 const NAVIGATIONS = { NAVIGATE: 'navigate to', SWAP: 'replace with', OVERLAY: 'open overlay', SCROLL_TO: 'scroll to', CHANGE_TO: 'change to variant' };
 
+/** Figma stores trigger `timeout` and `delay` in milliseconds (Plugin API, Trigger). 800 → "800ms", 1500 → "1.5s". */
+export function msStr(ms) {
+  return ms >= 1000 ? `${Math.round(ms / 100) / 10}s` : `${ms}ms`;
+}
+
 export function triggerStr(t) {
   if (!t) return 'on (no trigger)';
   let s = TRIGGERS[t.type] || String(t.type).toLowerCase();
-  if (t.type === 'AFTER_TIMEOUT' && typeof t.timeout === 'number') s += ` ${t.timeout}s`;
-  if (t.delay) s += ` (delay ${t.delay}s)`;
+  if (t.type === 'AFTER_TIMEOUT' && typeof t.timeout === 'number') s += ` ${msStr(t.timeout)}`;
+  if (t.delay) s += ` (delay ${msStr(t.delay)})`;
   if (t.keyCodes) s += ` [${t.keyCodes.join('+')}]`;
   return s;
 }
@@ -206,7 +211,9 @@ export function actionStr(a) {
   s += a.to ? ` ${a.toName ? quote(a.toName) + ' ' : ''}(\`${a.to}\`)` : ' (no destination)';
   const t = a.transition;
   if (t) {
-    const ms = typeof t.duration === 'number' ? ` ${t.duration}s` : ''; // Figma reports seconds
+    // Transition duration: the Plugin API docs give no unit; Figma forum reports point to seconds (0.3).
+    // Not verified on a real file yet (see docs/IMPROVEMENT-PLAN.md, P4).
+    const ms = typeof t.duration === 'number' ? ` ${t.duration}s` : '';
     s += `, ${String(t.type).toLowerCase().replace(/_/g, ' ')}${t.direction ? ' ' + t.direction.toLowerCase() : ''}${ms}${t.easing ? ' ' + t.easing.toLowerCase().replace(/_/g, '-') : ''}`;
   }
   if (a.preserveScroll) s += ', keep scroll position';

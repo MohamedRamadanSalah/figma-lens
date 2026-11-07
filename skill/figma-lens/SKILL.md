@@ -78,7 +78,7 @@ After building a screen, compare the real result against Figma and fix what diff
 3. **Read `design/<frame>/compare/report.md`** (mismatch %, the biggest differing areas and the Figma layer ids in each) and **look at `compare/side-by-side.png`** (Figma | build | diff, red = different).
 4. **Fix top-down**: height or spacing differences first (they shift everything below), then sizes, colors, typography, radii, shadows. Look up each listed layer id in spec.md for the exact values.
 5. **Re-run the check.** The report shows the previous score, so you can see progress.
-6. **Stop** when mismatch is ≤ 3% (text anti-aliasing never reaches 0) or when two runs in a row stop improving. Fix the text layers listed as **suspects** in report.md (weight, size or color off) first. Don't use `--text-tolerance` to get under the target: it can hide one-letter text changes. Then report the final score and anything you could not match, and why (missing font, platform rendering, dynamic data).
+6. **Stop** when the check's verdict says STOP: mismatch ≤ 3% (text anti-aliasing never reaches 0), or no real improvement since the previous check. Don't run one more check after a STOP. Fix the text layers listed as **suspects** in report.md (weight, size or color off) first. Don't use `--text-tolerance` to get under the target: it can hide one-letter text changes. Then report the final score and anything you could not match, and why (missing font, platform rendering, dynamic data).
 
 Rules: fix the real code, never game the diff (no screenshots or images of the design inside the app). Use the same data/text as the design when checking (mock data if needed), otherwise text differences dominate the score.
 
