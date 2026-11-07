@@ -56,10 +56,11 @@ Usage:
   figma-lens auto    --design design/<frame> [--config ${CONFIG_FILE}] [--dry-run]
       Run (or with --dry-run: only print) the Claude Code job for one export, e.g. to retry it.
 
-  figma-lens check   --design design/<frame> (--url <page url> | --adb) [--viewport] [--crop-top px] [--crop-bottom px] [--fail-above pct] [--text-tolerance units]
+  figma-lens check   --design design/<frame> (--url <page url> | --adb) [--viewport] [--crop-top px] [--crop-bottom px] [--fail-above pct] [--text-tolerance units] [--run id]
       Render your build and compare it with the Figma frame (shot + compare in one step).
       The last line is a verdict: STOP (within 3%, no real improvement in 2 checks, or 6 checks) or CONTINUE
-      (on "made it worse", undo the last change first). Judged per FIGMA_LENS_RUN session; without it, only the target stops.
+      (on "made it worse", undo the last change first). It is judged against earlier checks with the same
+      --run id (one id per task; FIGMA_LENS_RUN wins when set). Without an id, only the 3% target stops.
 
   figma-lens port
       Print a free TCP port on 127.0.0.1 (for a dev server).
@@ -71,7 +72,7 @@ Usage:
   figma-lens shot    --adb [--serial id] --out shot.png
       Render a web page (or Flutter web) at the frame's size, or an Android device/emulator, as an image.
 
-  figma-lens compare --design design/<frame> --actual shot.png [--crop-top px] [--crop-bottom px] [--out dir] [--fail-above pct] [--text-tolerance units]
+  figma-lens compare --design design/<frame> --actual shot.png [--crop-top px] [--crop-bottom px] [--out dir] [--fail-above pct] [--text-tolerance units] [--run id]
       Diff an image of your build against the frame. Writes compare/{report.md,report.json,diff.png,side-by-side.png}.
       --text-tolerance 1 (experimental, off by default) ignores glyph edges off by up to 1 design unit
       inside text layers; it can also hide one-letter text changes. Text suspects are always reported.
@@ -109,6 +110,9 @@ function parse(argv) {
 }
 
 const num = (v, d) => (v === undefined ? d : Number(v));
+// The session the check verdict judges against. FIGMA_LENS_RUN (auto mode sets a fresh one per Claude
+// session) wins over --run, so a retry that reuses an id is never judged against the last attempt.
+const runIdFrom = (flags) => process.env.FIGMA_LENS_RUN || flags.run || null;
 
 function needDesign(flags) {
   if (!flags.design) throw new Error('--design design/<frame> is required');
@@ -227,6 +231,7 @@ async function main() {
         cropBottom: num(flags['crop-bottom'], 0),
         textToleranceUnits: num(flags['text-tolerance'], 0),
         outDir: flags.out && path.resolve(flags.out),
+        runId: runIdFrom(flags),
       });
       printCompare(r, flags);
       return;
@@ -255,6 +260,7 @@ async function main() {
         cropBottom: num(flags['crop-bottom'], 0),
         textToleranceUnits: num(flags['text-tolerance'], 0),
         outDir,
+        runId: runIdFrom(flags),
       });
       printCompare(r, flags);
       return;

@@ -68,12 +68,12 @@ After building a screen, compare the real result against Figma and fix what diff
    - Web: start the dev server and open the route.
    - Flutter web: `flutter run -d web-server --web-port 8080`, then use that URL.
    - Flutter Android: run the app on an emulator/device and navigate to the screen.
-2. **Check it:**
-   - Web / Flutter web: `figma-lens check --design design/<frame> --url http://localhost:<port>/<route>`
+2. **Check it.** Pick one run id when the task starts, the frame name plus the current time (e.g. `--run card-screen-1432`), and pass the same `--run` to every check in this task; a new task gets a new id. The verdict compares only checks with this id (without one, it can only stop at the 3% target). In auto mode `FIGMA_LENS_RUN` is already set and takes precedence.
+   - Web / Flutter web: `figma-lens check --design design/<frame> --url http://localhost:<port>/<route> --run <id>`
      (the viewport is set to the frame's width and scale automatically, and the whole page is captured, so a
      build taller than the frame shows up as "N units taller"). For an app screen that scrolls on purpose and
      whose frame shows one screenful, add `--viewport`.
-   - Android: `figma-lens check --design design/<frame> --adb --crop-top <status bar px> [--crop-bottom <nav bar px>]`
+   - Android: `figma-lens check --design design/<frame> --adb --crop-top <status bar px> [--crop-bottom <nav bar px>] --run <id>`
      (status bar ≈ 24–48 dp × device density; crop it so only the app content is compared).
 3. **Read `design/<frame>/compare/report.md`** (mismatch %, the biggest differing areas and the Figma layer ids in each) and **look at `compare/side-by-side.png`** (Figma | build | diff, red = different).
 4. **Fix top-down**: height or spacing differences first (they shift everything below), then sizes, colors, typography, radii, shadows. Look up each listed layer id in spec.md for the exact values.

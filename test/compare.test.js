@@ -307,6 +307,26 @@ test('verdict: "no improvement" only against a check from the same Claude sessio
   }
 });
 
+test('CLI: --run groups checks into a session; FIGMA_LENS_RUN wins over it', () => {
+  const root = tmp();
+  const dir = makeExport(root);
+  const shot = path.join(root, 'off.png');
+  writePng(shot, drawScreen({ cardX: 80 }));
+  const { FIGMA_LENS_RUN, ...base } = process.env;
+  const verdict = (env, ...extra) => {
+    const r = spawnSync(process.execPath, [CLI, 'compare', '--design', dir, '--actual', shot, '--json', ...extra], { encoding: 'utf8', cwd: root, env: { ...base, ...env } });
+    assert.equal(r.status, 0, r.stderr);
+    return JSON.parse(r.stdout).verdict;
+  };
+  // interactive use: no env, the same --run id on every check of the task
+  assert.equal(verdict({}, '--run', 'task-1').stop, false);
+  assert.equal(verdict({}, '--run', 'task-1').stop, false);
+  assert.equal(verdict({}, '--run', 'task-1').why, 'plateau', 'manual checks with an id stop on a plateau');
+  assert.equal(verdict({}, '--run', 'task-2').stop, false, 'a new task id starts fresh');
+  // auto mode: the per-session env id is used even if Claude passes a reused --run id
+  assert.equal(verdict({ FIGMA_LENS_RUN: 'session-x' }, '--run', 'task-1').stop, false);
+});
+
 // Values are mismatch % in order; the last one is the current check.
 const verdictOf = (seq) => verdictFor(seq[seq.length - 1], seq.slice(0, -1));
 
