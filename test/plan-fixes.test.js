@@ -1,19 +1,8 @@
-// Compare verdict (stop the fix loop) and prototype timing units.
+// Prototype timing units and unattended-run tool limits. (The check verdict is tested in compare.test.js.)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { verdictFor } from '../tools/compare.js';
 import { triggerStr, msStr } from '../bridge/render-md.js';
 import { DEFAULT_ALLOWED_TOOLS } from '../tools/auto.js';
-
-test('check verdict: stop within the target, stop on a plateau, otherwise continue', () => {
-  assert.deepEqual([verdictFor(2.2, 3.4).stop, verdictFor(2.2, 3.4).why], [true, 'target']);
-  assert.equal(verdictFor(3, null).why, 'target');
-  assert.deepEqual([verdictFor(5.1, 5.2).stop, verdictFor(5.1, 5.2).why], [true, 'plateau']);
-  assert.equal(verdictFor(6, 5.4).why, 'plateau', 'worse than before is no improvement either');
-  assert.equal(verdictFor(5, 7).stop, false);
-  assert.equal(verdictFor(5, null).stop, false, 'first check above the target: continue');
-  assert.match(verdictFor(5, null).text, /^CONTINUE/);
-});
 
 test('prototype trigger timing is in milliseconds (Figma Plugin API)', () => {
   assert.equal(msStr(300), '300ms');

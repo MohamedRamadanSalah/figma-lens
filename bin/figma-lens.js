@@ -58,7 +58,8 @@ Usage:
 
   figma-lens check   --design design/<frame> (--url <page url> | --adb) [--viewport] [--crop-top px] [--crop-bottom px] [--fail-above pct] [--text-tolerance units]
       Render your build and compare it with the Figma frame (shot + compare in one step).
-      The last line is a verdict: STOP (within 3%, or no real improvement since the last check) or CONTINUE.
+      The last line is a verdict: STOP (within 3%, no real improvement in 2 checks, or 6 checks) or CONTINUE
+      (on "made it worse", undo the last change first). Judged per FIGMA_LENS_RUN session; without it, only the target stops.
 
   figma-lens port
       Print a free TCP port on 127.0.0.1 (for a dev server).

@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { blank, writePng, readPng, resize } from '../tools/image.js';
-import { compare, computeDiff } from '../tools/compare.js';
+import { compare, computeDiff, verdictFor } from '../tools/compare.js';
 import { initMap, loadMap, componentTarget, tokenTarget } from '../tools/map.js';
 import { makeDemo } from '../tools/demo.js';
 import { renderMarkdown, summarizeUsage } from '../bridge/render-md.js';
@@ -284,8 +284,70 @@ test('verdict: "no improvement" only against a check from the same Claude sessio
   const a1 = compare({ designDir: dir, actualFile: shot, runId: 'a' });
   assert.ok(a1.mismatchPct > 3, `mismatch ${a1.mismatchPct}%`);
   assert.equal(a1.verdict.stop, false);
-  assert.equal(compare({ designDir: dir, actualFile: shot, runId: 'a' }).verdict.why, 'plateau', 'same session, same score: stop');
+  assert.equal(a1.bestMismatchPct, null);
+  const a2 = compare({ designDir: dir, actualFile: shot, runId: 'a' });
+  assert.equal(a2.verdict.stop, false, 'one flat check is not a plateau yet');
+  assert.equal(a2.bestMismatchPct, a1.mismatchPct);
+  const a3 = compare({ designDir: dir, actualFile: shot, runId: 'a' });
+  assert.deepEqual([a3.verdict.stop, a3.verdict.why], [true, 'plateau'], 'same session, 2 flat checks in a row: stop');
+  const md = fs.readFileSync(path.join(dir, 'compare', 'report.md'), 'utf8');
+  assert.ok(md.includes(`**Verdict: ${a3.verdict.text}**`), 'report.md shows the same verdict text as the console');
   const b1 = compare({ designDir: dir, actualFile: shot, runId: 'b' });
   assert.equal(b1.verdict.stop, false, "a retry's first check is not judged against the last attempt");
+  assert.equal(b1.bestMismatchPct, null, 'history from run "a" is ignored');
+  assert.equal(b1.previousMismatchPct, a3.mismatchPct, 'previous score is still shown across runs');
   assert.match(fs.readFileSync(path.join(dir, 'compare', 'report.md'), 'utf8'), /Verdict: CONTINUE/);
+  // no run id: no session to judge against, so only the target can stop it
+  const saved = process.env.FIGMA_LENS_RUN;
+  delete process.env.FIGMA_LENS_RUN;
+  try {
+    for (let i = 0; i < 7; i++) assert.equal(compare({ designDir: dir, actualFile: shot }).verdict.stop, false);
+  } finally {
+    if (saved !== undefined) process.env.FIGMA_LENS_RUN = saved;
+  }
+});
+
+// Values are mismatch % in order; the last one is the current check.
+const verdictOf = (seq) => verdictFor(seq[seq.length - 1], seq.slice(0, -1));
+
+test('verdict: target, first, improved, regressed, flat, plateau', () => {
+  assert.deepEqual([verdictOf([2.5]).stop, verdictOf([2.5]).why], [true, 'target']);
+  assert.equal(verdictOf([3]).why, 'target', 'exactly the target counts');
+  assert.deepEqual([verdictOf([5.0]).stop, verdictOf([5.0]).why], [false, null], 'first check');
+  assert.match(verdictOf([5.0]).text, /^CONTINUE/);
+  assert.deepEqual([verdictOf([5.0, 4.0]).stop, verdictOf([5.0, 4.0]).why], [false, null], 'improved');
+  assert.equal(verdictOf([5.0, 4.8]).why, null, 'an improvement of exactly MIN_GAIN counts');
+
+  const worse = verdictOf([4.0, 6.0]);
+  assert.deepEqual([worse.stop, worse.why], [false, 'regressed']);
+  assert.match(worse.text, /^CONTINUE/);
+  assert.match(worse.text, /\b4%/);
+  assert.match(worse.text, /\b6%/);
+  assert.match(worse.text, /undo/i);
+
+  assert.deepEqual([verdictOf([4.0, 3.9]).stop, verdictOf([4.0, 3.9]).why], [false, null], 'first flat check');
+  const plateau = verdictOf([4.0, 3.9, 3.95]);
+  assert.deepEqual([plateau.stop, plateau.why], [true, 'plateau'], 'two non-improving in a row');
+  assert.match(plateau.text, /report what still differs and why/);
+  assert.deepEqual([verdictOf([4.0, 6.0, 4.0]).stop, verdictOf([4.0, 6.0, 4.0]).why], [true, 'plateau'], 'regressed, then flat against best 4.0');
+  assert.deepEqual([verdictOf([4.0, 6.0, 3.5]).stop, verdictOf([4.0, 6.0, 3.5]).why], [false, null], 'improved: streak reset');
+  assert.equal(verdictOf([4.0, 6.0, 3.5, 3.45]).stop, false, 'after a reset, one flat check is not a plateau');
+});
+
+test('verdict: a worse check never stops, except at the check limit', () => {
+  for (const seq of [[4.0, 6.0], [4.0, 3.9, 6.0], [4.0, 6.0, 6.5], [4.0, 6.0, 7.0, 8.0, 9.0]]) {
+    const v = verdictOf(seq);
+    assert.deepEqual([v.stop, v.why], [false, 'regressed'], seq.join(' → '));
+  }
+});
+
+test('verdict: the sixth check stops, and asks to restore the best version when worse', () => {
+  const limit = verdictOf([5, 4.5, 4.0, 3.6, 3.3, 3.1]);
+  assert.deepEqual([limit.stop, limit.why], [true, 'limit']);
+  assert.doesNotMatch(limit.text, /restore/i);
+  const limitWorse = verdictOf([5, 4.5, 4.0, 3.6, 3.3, 4.5]);
+  assert.deepEqual([limitWorse.stop, limitWorse.why], [true, 'limit']);
+  assert.match(limitWorse.text, /worse than your best result \(3\.3%\)/);
+  assert.match(limitWorse.text, /Restore the version that scored 3\.3%/);
+  assert.equal(verdictOf([5, 4.5, 4.0, 3.6, 3.3, 2.9]).why, 'target', 'the target still wins on the last check');
 });
